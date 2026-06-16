@@ -1,0 +1,13 @@
+Termux Studio
+Copyright 2026 poordevcode
+
+This product includes software developed as part of the
+Android Open Source Project (https://source.android.com), licensed under the
+Apache License, Version 2.0:
+
+  * prebuilt/aapt2-aarch64 — a native aarch64 build of AOSP's aapt2
+    (Android Asset Packaging Tool 2), compiled from platform-tools-35.0.2
+    source. See aapt2-build/ for the build recipe.
+
+The studio CLI, TUI, project generator, compatibility adapter and installer
+are original works, also licensed under Apache-2.0.

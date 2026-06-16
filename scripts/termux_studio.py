@@ -749,9 +749,9 @@ class TermuxStudio:
             print(f"{Colors.RED}termux-open not found — install it with: pkg install termux-api{Colors.END}")
             return
         print(f"\n{Colors.BOLD}Share {os.path.basename(apk)} as:{Colors.END}")
-        print("  1. APK file (Telegram, Drive, Bluetooth, email)")
-        print(f"  2. {Colors.GREEN}ZIP{Colors.END} (WhatsApp-safe — recipient unzips to get the APK)")
-        mode = input(f"{Colors.CYAN}Choice [2]: {Colors.END}").strip() or "2"
+        print(f"  1. {Colors.GREEN}APK file{Colors.END} (installable directly — Telegram, Drive, Bluetooth, Files, email)")
+        print("  2. ZIP (only if the target app rejects/crashes on APKs, e.g. WhatsApp)")
+        mode = input(f"{Colors.CYAN}Choice [1]: {Colors.END}").strip() or "1"
 
         to_share, ctype = apk, "application/octet-stream"
         if mode == "2":
