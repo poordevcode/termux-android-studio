@@ -929,80 +929,59 @@ class TermuxStudio:
         print(f"{Colors.YELLOW}Defaulting to the first APK.{Colors.END}")
         return apks[0]
 
-    def _shared_outdir(self):
-        """A real shared-storage dir every app can read (so a shared file resolves by path)."""
-        for d in ("/storage/emulated/0/Download", "/sdcard/Download",
-                  os.path.expanduser("~/storage/downloads")):
-            if os.path.isdir(d) and os.access(d, os.W_OK):
-                return d
-        return None
-
-    def _stage_for_share(self, apk, as_zip=False):
-        """Copy the APK (or a zip of it) into shared Download and register it with MediaStore.
-
-        The earlier 'path not found' in the receiving app happens because termux-open hands the
-        receiver Termux's own file path, which other apps can't resolve. Putting the file in
-        shared storage and running termux-media-scan makes Android index it, so the share intent
-        carries a content:// URI that resolves — and the file is also at a known path the user
-        can attach manually. Returns the staged path (or None)."""
-        outdir = self._shared_outdir()
+    def _ensure_shared(self, apk):
+        """Return a path other apps can read. /storage and /sdcard are already shared; a
+        Termux-private path (under /data/data/com.termux) is copied into Download, because no
+        other app can read Termux's private storage."""
+        if apk.startswith("/storage/") or apk.startswith("/sdcard/"):
+            return apk
+        outdir = next((d for d in ("/storage/emulated/0/Download", "/sdcard/Download")
+                       if os.path.isdir(d) and os.access(d, os.W_OK)), None)
         if not outdir:
-            print(f"{Colors.RED}No writable shared storage. Run: termux-setup-storage{Colors.END}")
-            return None
-        base = os.path.splitext(os.path.basename(apk))[0]
+            print(f"{Colors.YELLOW}No shared storage (run termux-setup-storage) — sharing in place.{Colors.END}")
+            return apk
+        dst = os.path.join(outdir, os.path.basename(apk))
         try:
-            if as_zip:
-                import zipfile
-                dst = os.path.join(outdir, base + ".zip")
-                with zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED) as z:
-                    z.write(apk, os.path.basename(apk))
-            else:
-                dst = os.path.join(outdir, os.path.basename(apk))
-                if os.path.abspath(apk) != os.path.abspath(dst):
-                    shutil.copy2(apk, dst)
+            if os.path.abspath(apk) != os.path.abspath(dst):
+                shutil.copy2(apk, dst)
+            return dst
         except Exception as e:
-            print(f"{Colors.RED}Could not stage the file for sharing: {e}{Colors.END}")
-            return None
-        # Index it so the share intent's content:// URI resolves in the receiving app.
-        if shutil.which("termux-media-scan"):
-            try:
-                subprocess.run(["termux-media-scan", dst],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
-            except Exception:
-                pass
-        return dst
+            print(f"{Colors.RED}Could not copy to shared storage: {e}{Colors.END}")
+            return apk
 
     def share_apk(self, apk):
-        """Share a built APK via the Android share sheet. The file is first staged in shared
-        Download and media-scanned so the receiving app can actually resolve it (fixes the
-        'path not found' from Termux's own file path), and the staged path is printed so it can
-        be attached manually if the share sheet still misbehaves. WhatsApp rejects raw .apk, so
-        a ZIP mode is offered for it."""
+        """Share the APK as a real file via an ACTION_SEND intent built directly with `am`.
+
+        termux-open wrapped the path in a content://com.termux.files URI that receivers couldn't
+        resolve ('Requested file was not found'). Instead we hand the intent a plain file:// URI
+        of the APK's actual path (with FLAG_GRANT_READ_URI_PERMISSION), which apps read directly.
+        Only Termux-private APKs are first copied to shared Download (others can't read them)."""
         if not apk:
             return
-        if not shutil.which("termux-open"):
-            print(f"{Colors.RED}termux-open not found — install it with: pkg install termux-api{Colors.END}")
+        apk = self._ensure_shared(os.path.abspath(apk))
+        if not os.path.isfile(apk):
+            print(f"{Colors.RED}APK not found: {apk}{Colors.END}")
             return
-        print(f"\n{Colors.BOLD}Share {os.path.basename(apk)} as:{Colors.END}")
-        print(f"  1. {Colors.GREEN}APK file{Colors.END} (installable directly — Telegram, Drive, Bluetooth, Files, email)")
-        print("  2. ZIP (only if the target app rejects/crashes on APKs, e.g. WhatsApp)")
-        mode = input(f"{Colors.CYAN}Choice [1]: {Colors.END}").strip() or "1"
-        as_zip = (mode == "2")
-
-        staged = self._stage_for_share(apk, as_zip)
-        if not staged:
-            return
-        ctype = "application/zip" if as_zip else "application/octet-stream"
-        print(f"\n{Colors.GREEN}Staged on shared storage:{Colors.END} {staged}  "
-              f"({os.path.getsize(staged)/1048576:.2f} MB)")
-        print(f"{Colors.YELLOW}Opening the share sheet…{Colors.END}")
+        uri = "file://" + apk
+        print(f"\n{Colors.YELLOW}Sharing {os.path.basename(apk)} "
+              f"({os.path.getsize(apk)/1048576:.2f} MB)…{Colors.END}")
         try:
-            subprocess.run(["termux-open", "--send", "--content-type", ctype, staged])
+            res = subprocess.run(
+                ["am", "start",
+                 "-a", "android.intent.action.SEND",
+                 "-t", "application/vnd.android.package-archive",
+                 "--eu", "android.intent.extra.STREAM", uri,
+                 "--grant-read-uri-permission"],
+                capture_output=True, text=True)
+            out = (res.stdout + res.stderr).strip()
+            if res.returncode != 0 or "Error" in out:
+                print(f"{Colors.RED}Share intent error:{Colors.END} {out}")
+            else:
+                print(f"{Colors.GREEN}Opened the Android share sheet.{Colors.END}")
         except Exception as e:
-            print(f"{Colors.RED}Share intent failed: {e}{Colors.END}")
-        print(f"\n{Colors.CYAN}If the target app still can't read it, attach this file directly "
-              f"from your file manager / the app's attach button:{Colors.END}")
-        print(f"  {Colors.BOLD}{staged}{Colors.END}")
+            print(f"{Colors.RED}Share failed: {e}{Colors.END}")
+        print(f"\n{Colors.CYAN}File location (attach manually if needed):{Colors.END} "
+              f"{Colors.BOLD}{apk}{Colors.END}")
 
     def check_environment(self):
         self.print_header()
