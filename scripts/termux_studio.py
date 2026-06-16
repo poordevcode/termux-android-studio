@@ -10,6 +10,7 @@ import shutil
 import shlex
 import getpass
 import json
+import re
 
 # Where per-project signing keystore details are remembered between release builds.
 KEYSTORE_DIR = os.path.expanduser("~/.studio/keystores")
@@ -219,10 +220,20 @@ class TermuxStudio:
         if not template:
             print(f"{Colors.RED}Invalid template.{Colors.END}"); time.sleep(1.5); return
 
+        # Package (applicationId) — default to com.example.<sanitized name>, like Android Studio.
+        safe = re.sub(r"[^a-zA-Z0-9]", "", name).lower() or "app"
+        if safe[0].isdigit():
+            safe = "a" + safe
+        default_pkg = f"com.example.{safe}"
+        package = input(f"{Colors.CYAN}Package name [{default_pkg}]: {Colors.END}").strip() or default_pkg
+        if not re.match(r"^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*)+$", package):
+            print(f"{Colors.RED}Invalid package name (need at least two dot-separated segments, "
+                  f"e.g. com.example.app).{Colors.END}"); time.sleep(2); return
+
         default_dir = os.path.join(os.path.expanduser("~"), "AndroidStudioProjects")
         parent = input(f"{Colors.CYAN}Parent directory [{default_dir}]: {Colors.END}").strip() or default_dir
 
-        cmd = ["studio", "new", name, template, "--dir", parent]
+        cmd = ["studio", "new", name, template, "--package", package, "--dir", parent]
         print(f"\n{Colors.YELLOW}Running: {' '.join(cmd)}{Colors.END}\n")
         try:
             subprocess.run(cmd)

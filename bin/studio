@@ -745,6 +745,15 @@ studio_new() {
         read -rp "$(echo -e "${CYAN}Choice (1/2): ${NC}")" t
         case "$t" in 1) template="compose" ;; 2) template="xml" ;; *) err "invalid choice"; return 1 ;; esac
     fi
+    # Prompt for the package (applicationId) when not supplied, like Android Studio.
+    if [ -z "$package" ]; then
+        local safe; safe="$(echo "$name" | tr -cd '[:alnum:]' | tr '[:upper:]' '[:lower:]')"
+        [ -z "$safe" ] && safe="app"
+        case "$safe" in [0-9]*) safe="a$safe" ;; esac
+        local def_pkg="com.example.$safe"
+        read -rp "$(echo -e "${CYAN}Package name [${def_pkg}]: ${NC}")" package
+        package="${package:-$def_pkg}"
+    fi
 
     local args=(--name "$name" --template "$template" --dir "$dir" --sdk "$SDK_DIR")
     [ -n "$package" ] && args+=(--package "$package")
