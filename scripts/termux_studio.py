@@ -713,21 +713,155 @@ class TermuxStudio:
                 subprocess.run(["studio", "adb", "connect"])
                 input("\nPress Enter to continue...")
             elif choice == "3":
-                # Logcat for the loaded project's app (falls back to the last-run package).
-                cmd = ["studio", "logcat"]
-                if self.project_path:
-                    cmd.append(self.project_path)
-                print(f"\n{Colors.YELLOW}Running: {' '.join(cmd)}  (Ctrl-C to stop){Colors.END}\n")
-                try:
-                    subprocess.run(cmd)
-                except KeyboardInterrupt:
-                    pass
-                input("\nPress Enter to continue...")
+                self.app_logs()
             elif choice == "4":
                 subprocess.run(["studio", "adb", "disconnect"])
                 input("\nPress Enter to continue...")
             else:
                 return
+
+    # ---------------------------------------------------------- app logs viewer
+    #
+    # A dedicated, colourised logcat viewer — visually distinct from the plain build-log
+    # stream — with per-level highlighting, a header box, and copy/save when you stop it.
+
+    # logcat "threadtime" line: "MM-DD HH:MM:SS.mmm  PID  TID L TAG: message"
+    _LOG_RE = None
+    _LEVEL_FG = {"V": "\033[90m", "D": "\033[96m", "I": "\033[92m",
+                 "W": "\033[93m", "E": "\033[91m", "F": "\033[1;91m", "A": "\033[1;91m"}
+    _LEVEL_BG = {"V": "\033[100m", "D": "\033[46m", "I": "\033[42m",
+                 "W": "\033[43m", "E": "\033[41m", "F": "\033[41m", "A": "\033[41m"}
+
+    @staticmethod
+    def _strip_ansi(s):
+        import re
+        return re.sub(r"\033\[[0-9;]*m", "", s)
+
+    def _format_log_line(self, line):
+        import re
+        if self._LOG_RE is None:
+            type(self)._LOG_RE = re.compile(
+                r"^(\d\d-\d\d )?(\d\d:\d\d:\d\d\.\d+)\s+(\d+)\s+(\d+)\s+([VDIWEFAS])\s+(.*?):\s?(.*)$")
+        # Pass through lines that already carry colour (studio's own status lines).
+        if "\033[" in line:
+            return line
+        m = self._LOG_RE.match(line)
+        if not m:
+            return f"\033[90m{line}\033[0m"          # separators / non-standard → dim
+        _d, t, _pid, _tid, lvl, tag, msg = m.groups()
+        fg = self._LEVEL_FG.get(lvl, "\033[0m")
+        chip = f"{self._LEVEL_BG.get(lvl, '')}\033[97m {lvl} \033[0m"   # white-on-colour badge
+        return f"\033[90m{t}\033[0m {chip} {Colors.BOLD}{tag}\033[0m{fg}: {msg}\033[0m"
+
+    def _log_header_box(self):
+        pkg = ""
+        try:
+            with open(os.path.expanduser("~/.studio/last_pkg")) as f:
+                pkg = f.read().strip()
+        except Exception:
+            pass
+        w = 60
+        g = Colors.GREEN
+        # Pad plain text by length (no wide/emoji chars) so the box borders stay aligned.
+        def row(text):
+            return f"{g}║{Colors.END}{text[:w]:<{w}}{g}║{Colors.END}"
+        print(f"{g}╔{'═' * w}╗{Colors.END}")
+        print(row("  APP LOGS  —  logcat (live)"))
+        if pkg:
+            print(row(f"  package: {pkg}"))
+        print(row("  levels:  E error  W warn  I info  D debug  V verbose"))
+        print(f"{g}╚{'═' * w}╝{Colors.END}")
+
+    def app_logs(self):
+        """Stream the app's logcat in a dedicated, colourised viewer; Ctrl-C to stop and copy/save."""
+        import collections
+        if not shutil.which("adb"):
+            print(f"{Colors.RED}adb not found (pkg install android-tools).{Colors.END}")
+            input("\nPress Enter to continue..."); return
+
+        cmd = ["studio", "logcat"]
+        if self.project_path:
+            cmd.append(self.project_path)
+
+        self.print_header()
+        self._log_header_box()
+        print(f"{Colors.YELLOW}Streaming… press Ctrl-C to stop and get copy/save options.{Colors.END}\n")
+
+        buf = collections.deque(maxlen=10000)
+        proc = None
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    text=True, bufsize=1)
+            for line in proc.stdout:
+                line = line.rstrip("\n")
+                buf.append(line)
+                print(self._format_log_line(line))
+        except KeyboardInterrupt:
+            pass
+        finally:
+            if proc and proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except Exception:
+                    proc.kill()
+        self._logs_post_menu(list(buf))
+
+    def _logs_post_menu(self, lines):
+        import re
+        # Drop studio's own status/info lines from the copyable set; keep real log lines.
+        real = [l for l in lines if self._strip_ansi(l).strip()]
+        if not real:
+            print(f"\n{Colors.YELLOW}No logs captured (is the app running? try 'Run on Device' first).{Colors.END}")
+            input("\nPress Enter to continue..."); return
+        errwarn = [l for l in real if re.search(r"\s[WEFA]\s", self._strip_ansi(l))]
+        while True:
+            print(f"\n{Colors.BOLD}⏸ Logs stopped — {len(real)} lines captured "
+                  f"({len(errwarn)} warnings/errors).{Colors.END}")
+            print("  1. Copy ALL to clipboard")
+            print(f"  2. Copy {Colors.RED}errors + warnings{Colors.END} only to clipboard")
+            print("  3. Save to file (Download)")
+            print("  4. Resume streaming")
+            print("  5. Back")
+            c = input(f"{Colors.CYAN}Choice: {Colors.END}").strip()
+            if c == "1":
+                self._copy_logs(real, "all logs")
+            elif c == "2":
+                self._copy_logs(errwarn, "errors+warnings")
+            elif c == "3":
+                self._save_logs(real)
+            elif c == "4":
+                self.app_logs(); return
+            else:
+                return
+
+    def _copy_logs(self, lines, what):
+        if not lines:
+            print(f"{Colors.YELLOW}Nothing to copy.{Colors.END}"); return
+        text = "\n".join(self._strip_ansi(l) for l in lines)
+        if shutil.which("termux-clipboard-set"):
+            try:
+                subprocess.run(["termux-clipboard-set"], input=text, text=True)
+                print(f"{Colors.GREEN}Copied {len(lines)} lines ({what}) to the clipboard.{Colors.END}")
+                return
+            except Exception as e:
+                print(f"{Colors.RED}Clipboard failed: {e}{Colors.END}")
+        print(f"{Colors.YELLOW}termux-clipboard-set unavailable (pkg install termux-api) — saving to file instead.{Colors.END}")
+        self._save_logs(lines)
+
+    def _save_logs(self, lines):
+        if not lines:
+            print(f"{Colors.YELLOW}Nothing to save.{Colors.END}"); return
+        fname = "applog_" + time.strftime("%Y%m%d_%H%M%S") + ".txt"
+        outdir = next((d for d in ("/storage/emulated/0/Download", "/sdcard/Download")
+                       if os.path.isdir(d) and os.access(d, os.W_OK)), os.path.expanduser("~"))
+        path = os.path.join(outdir, fname)
+        try:
+            with open(path, "w") as f:
+                f.write("\n".join(self._strip_ansi(l) for l in lines) + "\n")
+            print(f"{Colors.GREEN}Saved {len(lines)} lines to {path}{Colors.END}")
+        except Exception as e:
+            print(f"{Colors.RED}Save failed: {e}{Colors.END}")
 
     def locate_and_offer_apks(self):
         print(f"\n{Colors.BOLD}{Colors.CYAN}Searching for generated APKs...{Colors.END}")
