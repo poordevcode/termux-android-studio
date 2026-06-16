@@ -4,8 +4,10 @@ studio_new.py - scaffold a new Android project that builds with the Termux toolc
 
 Usage: studio_new.py --name NAME --template {compose|xml} --dir PARENT_DIR [--package PKG]
 
-Mirrors the proven version set on this device (AGP 9.2.1 / Gradle 9.5 / compileSdk 36,
-AGP built-in Kotlin). Produces a layout Android Studio also opens cleanly.
+Mirrors the proven version set on this device (AGP 9.2.1 / Gradle 9.5 / compileSdk 37,
+AGP built-in Kotlin) and the same default file layout Android Studio's "Empty Activity"
+templates produce — for Compose: ui/theme/{Color,Theme,Type}.kt + a <Name>Theme; for Views:
+colors.xml + Material3 themes (light + night) + a ViewBinding activity.
 """
 import argparse
 import os
@@ -42,6 +44,17 @@ def sanitize_pkg_segment(s):
     if s[0].isdigit():
         s = "a" + s
     return s
+
+
+def pascal_case(name):
+    """'My App' -> 'MyApp' — used for the theme name, like Android Studio."""
+    parts = re.split(r"[^a-zA-Z0-9]+", name)
+    pc = "".join(p[:1].upper() + p[1:] for p in parts if p)
+    if not pc:
+        pc = "App"
+    if pc[0].isdigit():
+        pc = "App" + pc
+    return pc
 
 
 # ---------------------------------------------------------------- shared files
@@ -181,19 +194,21 @@ def f_app_build(pkg, compose):
     )
 
 
-def f_manifest(compose):
-    theme = "@style/Theme.App"
+def f_manifest(theme_name):
     return (
         '<?xml version="1.0" encoding="utf-8"?>\n'
         '<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n\n'
         "    <application\n"
         '        android:allowBackup="true"\n'
+        '        android:icon="@mipmap/ic_launcher"\n'
         '        android:label="@string/app_name"\n'
+        '        android:roundIcon="@mipmap/ic_launcher_round"\n'
         '        android:supportsRtl="true"\n'
-        f'        android:theme="{theme}">\n'
+        f'        android:theme="@style/{theme_name}">\n'
         "        <activity\n"
         '            android:name=".MainActivity"\n'
-        '            android:exported="true">\n'
+        '            android:exported="true"\n'
+        f'            android:theme="@style/{theme_name}">\n'
         "            <intent-filter>\n"
         '                <action android:name="android.intent.action.MAIN" />\n'
         '                <category android:name="android.intent.category.LAUNCHER" />\n'
@@ -212,39 +227,123 @@ def f_strings(name):
     )
 
 
-def f_themes(compose):
-    if compose:
-        parent = "android:Theme.Material.Light.NoActionBar"
-    else:
-        parent = "Theme.Material3.DayNight.NoActionBar"
+# ---- Compose theme files (mirror Android Studio's ui/theme/* ) ----------------
+
+def f_color_kt(pkg):
     return (
-        "<resources>\n"
-        f'    <style name="Theme.App" parent="{parent}" />\n'
+        f"package {pkg}.ui.theme\n\n"
+        "import androidx.compose.ui.graphics.Color\n\n"
+        "val Purple80 = Color(0xFFD0BCFF)\n"
+        "val PurpleGrey80 = Color(0xFFCCC2DC)\n"
+        "val Pink80 = Color(0xFFEFB8C8)\n\n"
+        "val Purple40 = Color(0xFF6650a4)\n"
+        "val PurpleGrey40 = Color(0xFF625b71)\n"
+        "val Pink40 = Color(0xFF7D5260)\n"
+    )
+
+
+def f_type_kt(pkg):
+    return (
+        f"package {pkg}.ui.theme\n\n"
+        "import androidx.compose.material3.Typography\n"
+        "import androidx.compose.ui.text.TextStyle\n"
+        "import androidx.compose.ui.text.font.FontFamily\n"
+        "import androidx.compose.ui.text.font.FontWeight\n"
+        "import androidx.compose.ui.unit.sp\n\n"
+        "// Set of Material typography styles to start with\n"
+        "val Typography = Typography(\n"
+        "    bodyLarge = TextStyle(\n"
+        "        fontFamily = FontFamily.Default,\n"
+        "        fontWeight = FontWeight.Normal,\n"
+        "        fontSize = 16.sp,\n"
+        "        lineHeight = 24.sp,\n"
+        "        letterSpacing = 0.5.sp\n"
+        "    )\n"
+        ")\n"
+    )
+
+
+def f_theme_kt(pkg, theme_prefix):
+    return (
+        f"package {pkg}.ui.theme\n\n"
+        "import android.os.Build\n"
+        "import androidx.compose.foundation.isSystemInDarkTheme\n"
+        "import androidx.compose.material3.MaterialTheme\n"
+        "import androidx.compose.material3.darkColorScheme\n"
+        "import androidx.compose.material3.dynamicDarkColorScheme\n"
+        "import androidx.compose.material3.dynamicLightColorScheme\n"
+        "import androidx.compose.material3.lightColorScheme\n"
+        "import androidx.compose.runtime.Composable\n"
+        "import androidx.compose.ui.platform.LocalContext\n\n"
+        "private val DarkColorScheme = darkColorScheme(\n"
+        "    primary = Purple80,\n"
+        "    secondary = PurpleGrey80,\n"
+        "    tertiary = Pink80\n"
+        ")\n\n"
+        "private val LightColorScheme = lightColorScheme(\n"
+        "    primary = Purple40,\n"
+        "    secondary = PurpleGrey40,\n"
+        "    tertiary = Pink40\n"
+        ")\n\n"
+        "@Composable\n"
+        f"fun {theme_prefix}Theme(\n"
+        "    darkTheme: Boolean = isSystemInDarkTheme(),\n"
+        "    // Dynamic color is available on Android 12+\n"
+        "    dynamicColor: Boolean = true,\n"
+        "    content: @Composable () -> Unit\n"
+        ") {\n"
+        "    val colorScheme = when {\n"
+        "        dynamicColor && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> {\n"
+        "            val context = LocalContext.current\n"
+        "            if (darkTheme) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context)\n"
+        "        }\n\n"
+        "        darkTheme -> DarkColorScheme\n"
+        "        else -> LightColorScheme\n"
+        "    }\n\n"
+        "    MaterialTheme(\n"
+        "        colorScheme = colorScheme,\n"
+        "        typography = Typography,\n"
+        "        content = content\n"
+        "    )\n"
+        "}\n"
+    )
+
+
+def f_themes_compose(theme_name):
+    return (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<resources>\n'
+        f'    <style name="{theme_name}" parent="android:Theme.Material.Light.NoActionBar" />\n'
         "</resources>\n"
     )
 
 
-def f_mainactivity_compose(pkg):
+def f_mainactivity_compose(pkg, theme_prefix):
     return (
         f"package {pkg}\n\n"
         "import android.os.Bundle\n"
         "import androidx.activity.ComponentActivity\n"
         "import androidx.activity.compose.setContent\n"
+        "import androidx.activity.enableEdgeToEdge\n"
         "import androidx.compose.foundation.layout.fillMaxSize\n"
         "import androidx.compose.foundation.layout.padding\n"
-        "import androidx.compose.material3.MaterialTheme\n"
         "import androidx.compose.material3.Scaffold\n"
         "import androidx.compose.material3.Text\n"
         "import androidx.compose.runtime.Composable\n"
         "import androidx.compose.ui.Modifier\n"
-        "import androidx.compose.ui.tooling.preview.Preview\n\n"
+        "import androidx.compose.ui.tooling.preview.Preview\n"
+        f"import {pkg}.ui.theme.{theme_prefix}Theme\n\n"
         "class MainActivity : ComponentActivity() {\n"
         "    override fun onCreate(savedInstanceState: Bundle?) {\n"
         "        super.onCreate(savedInstanceState)\n"
+        "        enableEdgeToEdge()\n"
         "        setContent {\n"
-        "            MaterialTheme {\n"
-        "                Scaffold(modifier = Modifier.fillMaxSize()) { padding ->\n"
-        '                    Greeting("Termux", Modifier.padding(padding))\n'
+        f"            {theme_prefix}Theme {{\n"
+        "                Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->\n"
+        "                    Greeting(\n"
+        '                        name = "Android",\n'
+        "                        modifier = Modifier.padding(innerPadding)\n"
+        "                    )\n"
         "                }\n"
         "            }\n"
         "        }\n"
@@ -252,15 +351,54 @@ def f_mainactivity_compose(pkg):
         "}\n\n"
         "@Composable\n"
         "fun Greeting(name: String, modifier: Modifier = Modifier) {\n"
-        '    Text(text = "Hello $name!", modifier = modifier)\n'
+        '    Text(\n'
+        '        text = "Hello $name!",\n'
+        "        modifier = modifier\n"
+        "    )\n"
         "}\n\n"
         "@Preview(showBackground = true)\n"
         "@Composable\n"
         "fun GreetingPreview() {\n"
-        "    MaterialTheme {\n"
-        '        Greeting("Termux")\n'
+        f"    {theme_prefix}Theme {{\n"
+        '        Greeting("Android")\n'
         "    }\n"
         "}\n"
+    )
+
+
+# ---- Views / XML resources (mirror Android Studio's Empty Views Activity) ------
+
+def f_colors_xml():
+    return (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        "<resources>\n"
+        '    <color name="black">#FF000000</color>\n'
+        '    <color name="white">#FFFFFFFF</color>\n'
+        '    <color name="purple_200">#FFBB86FC</color>\n'
+        '    <color name="purple_500">#FF6200EE</color>\n'
+        '    <color name="purple_700">#FF3700B3</color>\n'
+        '    <color name="teal_200">#FF03DAC5</color>\n'
+        '    <color name="teal_700">#FF018786</color>\n'
+        "</resources>\n"
+    )
+
+
+def f_themes_xml(theme_name, night=False):
+    primary = "@color/purple_200" if night else "@color/purple_500"
+    primary_variant = "@color/purple_700"
+    on_primary = "@color/black" if night else "@color/white"
+    return (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<resources xmlns:tools="http://schemas.android.com/tools">\n'
+        f'    <style name="{theme_name}" parent="Theme.Material3.DayNight.NoActionBar">\n'
+        f'        <item name="colorPrimary">{primary}</item>\n'
+        f'        <item name="colorPrimaryVariant">{primary_variant}</item>\n'
+        f'        <item name="colorOnPrimary">{on_primary}</item>\n'
+        '        <item name="colorSecondary">@color/teal_200</item>\n'
+        '        <item name="colorSecondaryVariant">@color/teal_700</item>\n'
+        '        <item name="colorOnSecondary">@color/black</item>\n'
+        "    </style>\n"
+        "</resources>\n"
     )
 
 
@@ -288,8 +426,10 @@ def f_layout_xml():
         "<androidx.constraintlayout.widget.ConstraintLayout "
         'xmlns:android="http://schemas.android.com/apk/res/android"\n'
         '    xmlns:app="http://schemas.android.com/apk/res-auto"\n'
+        '    xmlns:tools="http://schemas.android.com/tools"\n'
         '    android:layout_width="match_parent"\n'
-        '    android:layout_height="match_parent">\n\n'
+        '    android:layout_height="match_parent"\n'
+        '    tools:context=".MainActivity">\n\n'
         "    <TextView\n"
         '        android:id="@+id/textView"\n'
         '        android:layout_width="wrap_content"\n'
@@ -300,6 +440,72 @@ def f_layout_xml():
         '        app:layout_constraintStart_toStartOf="parent"\n'
         '        app:layout_constraintTop_toTopOf="parent" />\n\n'
         "</androidx.constraintlayout.widget.ConstraintLayout>\n"
+    )
+
+
+def f_backup_rules():
+    return (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        "<full-backup-content>\n"
+        "</full-backup-content>\n"
+    )
+
+
+def f_data_extraction_rules():
+    return (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        "<data-extraction-rules>\n"
+        "    <cloud-backup>\n"
+        "    </cloud-backup>\n"
+        "</data-extraction-rules>\n"
+    )
+
+
+# ---- launcher icons (vector only — no binaries, builds on minSdk 24) ----------
+
+def f_ic_background():
+    return (
+        '<vector xmlns:android="http://schemas.android.com/apk/res/android"\n'
+        '    android:width="108dp" android:height="108dp"\n'
+        '    android:viewportWidth="108" android:viewportHeight="108">\n'
+        '    <path android:fillColor="#3DDC84" android:pathData="M0,0h108v108h-108z" />\n'
+        "</vector>\n"
+    )
+
+
+def f_ic_foreground():
+    # A simple centred white circle (108x108 canvas, safe zone is the middle ~72dp).
+    return (
+        '<vector xmlns:android="http://schemas.android.com/apk/res/android"\n'
+        '    android:width="108dp" android:height="108dp"\n'
+        '    android:viewportWidth="108" android:viewportHeight="108">\n'
+        '    <path android:fillColor="#FFFFFF"\n'
+        '        android:pathData="M54,32 A22,22 0 1 0 54,76 A22,22 0 1 0 54,32 Z" />\n'
+        "</vector>\n"
+    )
+
+
+def f_ic_adaptive():
+    return (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">\n'
+        '    <background android:drawable="@drawable/ic_launcher_background" />\n'
+        '    <foreground android:drawable="@drawable/ic_launcher_foreground" />\n'
+        '    <monochrome android:drawable="@drawable/ic_launcher_foreground" />\n'
+        "</adaptive-icon>\n"
+    )
+
+
+def f_ic_fallback():
+    # Full icon as a single vector for API 24–25 (no adaptive-icon there).
+    return (
+        '<vector xmlns:android="http://schemas.android.com/apk/res/android"\n'
+        '    android:width="108dp" android:height="108dp"\n'
+        '    android:viewportWidth="108" android:viewportHeight="108">\n'
+        '    <path android:fillColor="#3DDC84" android:pathData="M0,0h108v108h-108z" />\n'
+        '    <path android:fillColor="#FFFFFF"\n'
+        '        android:pathData="M54,32 A22,22 0 1 0 54,76 A22,22 0 1 0 54,32 Z" />\n'
+        "</vector>\n"
     )
 
 
@@ -336,9 +542,12 @@ def main():
     name = args.name.strip()
     compose = args.template == "compose"
     safe_name = sanitize_pkg_segment(name)
-    pkg = args.package or f"com.termux.{safe_name}"
+    pkg = args.package or f"com.example.{safe_name}"
     if not re.match(r"^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*)+$", pkg):
         die(f"invalid package name: {pkg}")
+
+    theme_prefix = pascal_case(name)
+    theme_name = f"Theme.{theme_prefix}"
 
     root = os.path.abspath(os.path.join(os.path.expanduser(args.dir), name))
     if os.path.exists(root) and os.listdir(root):
@@ -346,6 +555,8 @@ def main():
 
     pkg_path = pkg.replace(".", "/")
     src_main = os.path.join(root, "app/src/main")
+    code_dir = os.path.join(src_main, "java", pkg_path)
+    res = os.path.join(src_main, "res")
 
     print(f"{C['c']}Scaffolding {C['b']}{args.template}{C['e']}{C['c']} project "
           f"'{name}' ({pkg}){C['e']}")
@@ -361,13 +572,35 @@ def main():
     write(os.path.join(root, "app/build.gradle"), f_app_build(pkg, compose))
     write(os.path.join(root, "app/proguard-rules.pro"), f_proguard())
     write(os.path.join(root, "app/.gitignore"), "/build\n")
-    write(os.path.join(src_main, "AndroidManifest.xml"), f_manifest(compose))
-    write(os.path.join(src_main, f"java/{pkg_path}/MainActivity.kt"),
-          f_mainactivity_compose(pkg) if compose else f_mainactivity_xml(pkg))
-    write(os.path.join(src_main, "res/values/strings.xml"), f_strings(name))
-    write(os.path.join(src_main, "res/values/themes.xml"), f_themes(compose))
-    if not compose:
-        write(os.path.join(src_main, "res/layout/activity_main.xml"), f_layout_xml())
+    write(os.path.join(src_main, "AndroidManifest.xml"), f_manifest(theme_name))
+    write(os.path.join(code_dir, "MainActivity.kt"),
+          f_mainactivity_compose(pkg, theme_prefix) if compose else f_mainactivity_xml(pkg))
+    write(os.path.join(res, "values/strings.xml"), f_strings(name))
+
+    # backup/data-extraction stubs (present in every AS project)
+    write(os.path.join(res, "xml/backup_rules.xml"), f_backup_rules())
+    write(os.path.join(res, "xml/data_extraction_rules.xml"), f_data_extraction_rules())
+
+    # launcher icons (adaptive on API 26+, vector fallback for 24–25)
+    write(os.path.join(res, "drawable/ic_launcher_background.xml"), f_ic_background())
+    write(os.path.join(res, "drawable/ic_launcher_foreground.xml"), f_ic_foreground())
+    write(os.path.join(res, "mipmap-anydpi-v26/ic_launcher.xml"), f_ic_adaptive())
+    write(os.path.join(res, "mipmap-anydpi-v26/ic_launcher_round.xml"), f_ic_adaptive())
+    write(os.path.join(res, "mipmap/ic_launcher.xml"), f_ic_fallback())
+    write(os.path.join(res, "mipmap/ic_launcher_round.xml"), f_ic_fallback())
+
+    if compose:
+        # ui/theme/{Color,Theme,Type}.kt — the Android Studio Compose theme package
+        theme_dir = os.path.join(code_dir, "ui", "theme")
+        write(os.path.join(theme_dir, "Color.kt"), f_color_kt(pkg))
+        write(os.path.join(theme_dir, "Type.kt"), f_type_kt(pkg))
+        write(os.path.join(theme_dir, "Theme.kt"), f_theme_kt(pkg, theme_prefix))
+        write(os.path.join(res, "values/themes.xml"), f_themes_compose(theme_name))
+    else:
+        write(os.path.join(res, "layout/activity_main.xml"), f_layout_xml())
+        write(os.path.join(res, "values/colors.xml"), f_colors_xml())
+        write(os.path.join(res, "values/themes.xml"), f_themes_xml(theme_name, night=False))
+        write(os.path.join(res, "values-night/themes.xml"), f_themes_xml(theme_name, night=True))
 
     # gradle wrapper (for Android Studio compatibility)
     if copy_wrapper(root):
