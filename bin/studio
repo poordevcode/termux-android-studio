@@ -104,23 +104,36 @@ ensure_debug_keystore() {
 # uses). Prints each new path on stdout. Gradle re-creates app-release.apk on the next build,
 # so this never accumulates duplicates for the same version.
 rename_release_apks() {
-    local proj="$1"
+    local proj="$1" custom="$2"
     local a2; a2="$(aapt2_bin)"
     [ -n "$a2" ] && [ -x "$a2" ] || return 0
-    local apk
+    # A user-supplied name overrides the auto <label>_<version> scheme. Sanitise it the same
+    # way (spaces -> "_", strip a trailing .apk, keep only alnum/._-).
+    local cbase=""
+    if [ -n "$custom" ]; then
+        cbase="$(echo "$custom" | sed 's/\.apk$//' | tr ' ' '_' | tr -cd '[:alnum:]._-')"
+    fi
+    local apk count=0
     while IFS= read -r apk; do
         [ -n "$apk" ] || continue
-        local badging label ver
-        badging="$("$a2" dump badging "$apk" 2>/dev/null)"
-        label="$(sed -n "s/^application-label:'\([^']*\)'.*/\1/p" <<<"$badging" | head -n1)"
-        [ -z "$label" ] && label="$(sed -n "s/^application-label-[^:]*:'\([^']*\)'.*/\1/p" <<<"$badging" | head -n1)"
-        ver="$(sed -n "s/.* versionName='\([^']*\)'.*/\1/p" <<<"$badging" | head -n1)"
-        [ -z "$label" ] && continue
-        # Sanitise for a filename: spaces -> "_", drop anything not alnum/._-.
-        local clean; clean="$(echo "$label" | tr ' ' '_' | tr -cd '[:alnum:]._-')"
-        [ -z "$clean" ] && continue
-        local vclean; vclean="$(echo "$ver" | tr ' ' '_' | tr -cd '[:alnum:]._-')"
-        local newname="$clean"; [ -n "$vclean" ] && newname="${clean}_${vclean}"
+        local newname
+        if [ -n "$cbase" ]; then
+            # Custom name; suffix _N for any additional (flavoured) release APKs so none clash.
+            newname="$cbase"; [ "$count" -gt 0 ] && newname="${cbase}_${count}"
+        else
+            local badging label ver
+            badging="$("$a2" dump badging "$apk" 2>/dev/null)"
+            label="$(sed -n "s/^application-label:'\([^']*\)'.*/\1/p" <<<"$badging" | head -n1)"
+            [ -z "$label" ] && label="$(sed -n "s/^application-label-[^:]*:'\([^']*\)'.*/\1/p" <<<"$badging" | head -n1)"
+            ver="$(sed -n "s/.* versionName='\([^']*\)'.*/\1/p" <<<"$badging" | head -n1)"
+            [ -z "$label" ] && continue
+            # Sanitise for a filename: spaces -> "_", drop anything not alnum/._-.
+            local clean; clean="$(echo "$label" | tr ' ' '_' | tr -cd '[:alnum:]._-')"
+            [ -z "$clean" ] && continue
+            local vclean; vclean="$(echo "$ver" | tr ' ' '_' | tr -cd '[:alnum:]._-')"
+            newname="$clean"; [ -n "$vclean" ] && newname="${clean}_${vclean}"
+        fi
+        count=$((count+1))
         local dir target; dir="$(dirname "$apk")"; target="$dir/${newname}.apk"
         [ "$apk" = "$target" ] && continue
         mv -f "$apk" "$target" && echo "$target"
@@ -287,7 +300,7 @@ studio_build() {
     fi
     # Separate keystore/signing flags from the Gradle tasks. Everything that isn't a
     # signing flag is forwarded verbatim to Gradle.
-    local ks_file="" ks_pass="" ks_alias="" key_pass="" jdk_override=""
+    local ks_file="" ks_pass="" ks_alias="" key_pass="" jdk_override="" apk_name=""
     while [ $# -gt 0 ]; do
         case "$1" in
             --keystore|--ks)        ks_file="$2"; shift 2 ;;
@@ -295,6 +308,7 @@ studio_build() {
             --ks-alias|--alias)     ks_alias="$2"; shift 2 ;;
             --key-pass)             key_pass="$2"; shift 2 ;;
             --jdk|--java)           jdk_override="$2"; shift 2 ;;
+            --apk-name|--release-name) apk_name="$2"; shift 2 ;;
             *)                      tasks+=("$1"); shift ;;
         esac
     done
@@ -386,9 +400,10 @@ studio_build() {
     echo
     if [ $rc -eq 0 ]; then
         ok "build successful"
-        # For release builds, rename app-release.apk -> <App Label>_<version>.apk.
+        # For release builds, rename app-release.apk -> <App Label>_<version>.apk
+        # (or to --apk-name when the user supplied one).
         if printf '%s\n' "${tasks[@]}" | grep -qi 'release'; then
-            rename_release_apks "$proj" >/dev/null
+            rename_release_apks "$proj" "$apk_name" >/dev/null
         fi
         local apks
         apks=$(find "$proj" -path "*/build/outputs/apk/*.apk" 2>/dev/null)
@@ -910,8 +925,8 @@ usage() {
     echo -e "  ${GREEN}build${NC} [path] [gradle tasks...]   Build (default :app:assembleDebug)"
     echo -e "                 Build JDK: ${CYAN}--jdk <11|17|21|/path>${NC} (else per-project pin, else default)"
     echo -e "                 Release signing: ${CYAN}--keystore FILE --ks-pass PW --ks-alias A [--key-pass PW]${NC}"
-    echo -e "                 (release builds with no keystore are signed with the debug keystore;"
-    echo -e "                  the signed release APK is renamed to ${CYAN}<App Label>_<version>.apk${NC})"
+    echo -e "                 Release APK name: ${CYAN}--apk-name NAME${NC} (default ${CYAN}<App Label>_<version>.apk${NC})"
+    echo -e "                 (release builds with no keystore are signed with the debug keystore)"
     echo -e "  ${GREEN}run${NC}  [path] [--release] [--no-launch] [--logcat] [signing flags]   Build, install & launch (like AS ▶)"
     echo -e "  ${GREEN}adb${NC}  {pair|connect [port]|disconnect|status}   Wireless debugging (Android 11+, no root)"
     echo -e "  ${GREEN}jdk${NC}  {list|install <ver>|use <ver> [project]|which}   Manage build JDKs (11/17/21)"

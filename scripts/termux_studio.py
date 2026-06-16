@@ -530,6 +530,11 @@ class TermuxStudio:
         self.print_header()
         print(f"{Colors.BOLD}Assemble Release APK{Colors.END}\n")
 
+        # Optional custom output name (else the CLI auto-names it <App Label>_<version>.apk).
+        custom_name = input(
+            f"{Colors.CYAN}Release APK name [blank = <App Label>_<version>]: {Colors.END}").strip()
+        name_args = ["--apk-name", custom_name] if custom_name else []
+
         saved = self.load_saved_keystore()
         # Build the signing-source menu, mapping printed numbers to handlers dynamically so
         # the "use saved keystore" entry only appears when one is remembered.
@@ -553,7 +558,8 @@ class TermuxStudio:
 
         if action == "debug":
             # studio CLI falls back to the debug keystore automatically.
-            return self.run_gradle_task("assembleRelease")
+            parts = ["assembleRelease"] + name_args
+            return self.run_gradle_task(" ".join(shlex.quote(p) for p in parts))
 
         if action == "saved":
             ks_path, store_pass = saved["path"], saved["store_pass"]
@@ -596,7 +602,7 @@ class TermuxStudio:
             "--ks-pass", store_pass,
             "--ks-alias", alias,
             "--key-pass", key_pass,
-        ]
+        ] + name_args
         task = " ".join(shlex.quote(p) for p in parts)
         return self.run_gradle_task(task)
 
@@ -731,24 +737,52 @@ class TermuxStudio:
         return apks[0]
 
     def share_apk(self, apk):
-        """Hand the APK to Android's share sheet via termux-open --send, so it can be sent
-        through WhatsApp/Drive/Bluetooth/etc. straight from the build menu."""
+        """Share a built APK via the Android share sheet (termux-open --send). WhatsApp (and
+        some others) crash on a raw .apk share intent regardless of the declared mime, because
+        they recognise the .apk and route it to their package handler. The reliable fix is to
+        wrap it in a .zip, which every messenger treats as a plain document — the recipient
+        unzips to get the installable APK. Direct-APK mode stays for apps that accept it
+        (Telegram, Drive, Bluetooth, email)."""
         if not apk:
             return
         if not shutil.which("termux-open"):
             print(f"{Colors.RED}termux-open not found — install it with: pkg install termux-api{Colors.END}")
             return
-        # Share as a generic binary, NOT application/vnd.android.package-archive. The package
-        # mime makes apps like WhatsApp route the APK to their installer/preview path and crash;
-        # as application/octet-stream the file is sent as a plain document (filename kept), which
-        # WhatsApp/Drive/Bluetooth handle fine and the recipient can still install.
-        print(f"\n{Colors.YELLOW}Opening the share sheet for {os.path.basename(apk)}…{Colors.END}")
+        print(f"\n{Colors.BOLD}Share {os.path.basename(apk)} as:{Colors.END}")
+        print("  1. APK file (Telegram, Drive, Bluetooth, email)")
+        print(f"  2. {Colors.GREEN}ZIP{Colors.END} (WhatsApp-safe — recipient unzips to get the APK)")
+        mode = input(f"{Colors.CYAN}Choice [2]: {Colors.END}").strip() or "2"
+
+        to_share, ctype = apk, "application/octet-stream"
+        if mode == "2":
+            zpath = self._zip_for_share(apk)
+            if not zpath:
+                return
+            to_share, ctype = zpath, "application/zip"
+
+        print(f"\n{Colors.YELLOW}Opening the share sheet for {os.path.basename(to_share)}…{Colors.END}")
         try:
-            subprocess.run(["termux-open", "--send",
-                            "--content-type", "application/octet-stream", apk])
-            print(f"{Colors.GREEN}Handed APK to the Android share sheet.{Colors.END}")
+            subprocess.run(["termux-open", "--send", "--content-type", ctype, to_share])
+            print(f"{Colors.GREEN}Handed {os.path.basename(to_share)} to the Android share sheet.{Colors.END}")
         except Exception as e:
             print(f"{Colors.RED}Failed to share: {e}{Colors.END}")
+
+    def _zip_for_share(self, apk):
+        """Wrap the APK in a .zip on shared storage (any app can read it there) and return the
+        path. Falls back to the APK's own directory if shared storage isn't writable."""
+        import zipfile
+        base = os.path.splitext(os.path.basename(apk))[0]
+        outdir = next((d for d in ("/storage/emulated/0/Download", "/sdcard/Download")
+                       if os.path.isdir(d) and os.access(d, os.W_OK)), os.path.dirname(apk))
+        zpath = os.path.join(outdir, base + ".zip")
+        try:
+            with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
+                z.write(apk, os.path.basename(apk))
+            print(f"{Colors.GREEN}Zipped to {zpath} ({os.path.getsize(zpath)/1048576:.2f} MB){Colors.END}")
+            return zpath
+        except Exception as e:
+            print(f"{Colors.RED}Could not create zip: {e}{Colors.END}")
+            return None
 
     def check_environment(self):
         self.print_header()
