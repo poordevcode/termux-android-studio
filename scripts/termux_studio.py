@@ -363,13 +363,17 @@ class TermuxStudio:
         print("3. Clean Project (clean)")
         print("4. Clean and Assemble Debug")
         print(f"5. {Colors.GREEN}Run on Device ▶{Colors.END} (build + install + launch, like Android Studio)")
-        print("6. Back to Main Menu")
+        print("6. Reset remembered release settings (keystore / name / skip-prompts)")
+        print("7. Back to Main Menu")
         print()
 
-        choice = input(f"{Colors.CYAN}Choice (1-6): {Colors.END}").strip()
+        choice = input(f"{Colors.CYAN}Choice (1-7): {Colors.END}").strip()
 
         if choice == "5":
             self.run_on_device()
+            return
+        if choice == "6":
+            self.reset_release_memory()
             return
         if choice == "1":
             success = self.run_gradle_task("assembleDebug")
@@ -410,33 +414,79 @@ class TermuxStudio:
         key = self.project_path.replace("/", "_").replace(" ", "_")
         return os.path.join(KEYSTORE_DIR, key + ".json")
 
-    def load_saved_keystore(self):
-        """Return remembered keystore details for this project, or None."""
+    def load_release_config(self):
+        """Raw remembered release settings for this project — keystore + apk name + the
+        'auto' (skip-prompts) flag — or None. No validation here; callers check as needed."""
         f = self._keystore_config_file()
         if os.path.isfile(f):
             try:
                 with open(f) as fh:
-                    data = json.load(fh)
-                # Only offer it if the keystore file is still there.
-                if data.get("path") and os.path.isfile(data["path"]):
-                    return data
+                    return json.load(fh)
             except Exception:
                 return None
         return None
 
-    def save_keystore(self, data):
-        """Remember keystore details for next time (plaintext, on-device, perms 600)."""
+    def save_release_config(self, data):
+        """Persist release settings for next time (plaintext, on-device, perms 600)."""
         f = self._keystore_config_file()
         try:
             with open(f, "w") as fh:
                 json.dump(data, fh)
             os.chmod(f, 0o600)
-            print(f"{Colors.GREEN}Saved keystore details for next release build "
-                  f"({Colors.YELLOW}stored locally with 600 perms{Colors.GREEN}).{Colors.END}")
             return True
         except Exception as e:
-            print(f"{Colors.RED}Could not save keystore details: {e}{Colors.END}")
+            print(f"{Colors.RED}Could not save release settings: {e}{Colors.END}")
             return False
+
+    def reset_release_memory(self):
+        """Forget the remembered release settings (keystore/name/skip) for this project."""
+        self.print_header()
+        if not self.project_path:
+            print(f"{Colors.RED}Please load a project first!{Colors.END}")
+            time.sleep(1.5)
+            return
+        f = self._keystore_config_file()
+        if os.path.isfile(f):
+            try:
+                os.remove(f)
+                print(f"{Colors.GREEN}Remembered release settings cleared for this project.{Colors.END}")
+                print(f"{Colors.CYAN}The next release build will ask for the keystore + name again.{Colors.END}")
+            except Exception as e:
+                print(f"{Colors.RED}Could not clear: {e}{Colors.END}")
+        else:
+            print(f"{Colors.YELLOW}No remembered release settings for this project.{Colors.END}")
+        input("\nPress Enter to continue...")
+
+    def _release_task(self, ks, custom_name):
+        """Compose the `assembleRelease` gradle command. ks=None signs with the debug keystore."""
+        parts = ["assembleRelease"]
+        if ks:
+            parts += ["--keystore", ks["path"], "--ks-pass", ks["store_pass"],
+                      "--ks-alias", ks["alias"], "--key-pass", ks["key_pass"]]
+        if custom_name:
+            parts += ["--apk-name", custom_name]
+        return " ".join(shlex.quote(p) for p in parts)
+
+    def _maybe_remember_release(self, ks, custom_name):
+        """Offer to persist the release settings, optionally skipping all prompts next time."""
+        print(f"\n{Colors.BOLD}Remember these release settings for next time?{Colors.END}")
+        print("  1. No")
+        print("  2. Remember keystore + name (still confirm each build)")
+        print(f"  3. {Colors.GREEN}Remember everything & skip prompts{Colors.END} — build directly next time")
+        c = input(f"{Colors.CYAN}Choice [1]: {Colors.END}").strip() or "1"
+        if c not in ("2", "3"):
+            return
+        data = {"apk_name": custom_name, "auto": (c == "3")}
+        if ks:
+            data.update({"path": ks["path"], "store_pass": ks["store_pass"],
+                         "alias": ks["alias"], "key_pass": ks["key_pass"]})
+        if self.save_release_config(data):
+            if c == "3":
+                print(f"{Colors.GREEN}Saved — the next release build will run directly with these settings.{Colors.END}")
+            else:
+                print(f"{Colors.GREEN}Saved keystore + name.{Colors.END}")
+            print(f"{Colors.YELLOW}(stored locally with 600 perms; clear it via Build menu → "
+                  f"'Reset remembered release settings'){Colors.END}")
 
     def list_keystore_aliases(self, ks_path, store_pass):
         """List key aliases in a keystore. Returns a list, or None if the store password
@@ -530,23 +580,39 @@ class TermuxStudio:
         self.print_header()
         print(f"{Colors.BOLD}Assemble Release APK{Colors.END}\n")
 
-        # Optional custom output name (else the CLI auto-names it <App Label>_<version>.apk).
-        custom_name = input(
-            f"{Colors.CYAN}Release APK name [blank = <App Label>_<version>]: {Colors.END}").strip()
-        name_args = ["--apk-name", custom_name] if custom_name else []
+        cfg = self.load_release_config()
 
-        saved = self.load_saved_keystore()
-        # Build the signing-source menu, mapping printed numbers to handlers dynamically so
-        # the "use saved keystore" entry only appears when one is remembered.
+        # ── Fast path: settings remembered with "skip prompts" → build directly ──
+        if cfg and cfg.get("auto"):
+            ks = cfg if cfg.get("path") else None
+            if ks and not os.path.isfile(ks["path"]):
+                print(f"{Colors.YELLOW}Remembered keystore is gone ({ks['path']}); reconfiguring…{Colors.END}\n")
+            else:
+                nm = cfg.get("apk_name") or ""
+                where = (f"{ks['path']}  alias {ks['alias']}" if ks else "debug keystore")
+                print(f"{Colors.GREEN}Using remembered release settings (skip-prompts is ON):{Colors.END}")
+                print(f"  keystore: {where}")
+                print(f"  apk name: {nm or '<App Label>_<version>'}")
+                print(f"{Colors.CYAN}  (reset via Build menu → 'Reset remembered release settings'){Colors.END}\n")
+                return self.run_gradle_task(self._release_task(ks, nm))
+
+        # ── Interactive flow ──
+        # Pre-fill the name prompt with a remembered one (Enter reuses it).
+        default_name = (cfg or {}).get("apk_name", "")
+        custom_name = input(
+            f"{Colors.CYAN}Release APK name [{default_name or '<App Label>_<version>'}]: {Colors.END}"
+        ).strip() or default_name
+
+        have_saved_ks = bool(cfg and cfg.get("path") and os.path.isfile(cfg["path"]))
         opts = []
-        if saved:
-            opts.append(("saved", f"Use saved keystore: {saved['path']} "
-                                  f"(alias {Colors.GREEN}{saved['alias']}{Colors.END})"))
+        if have_saved_ks:
+            opts.append(("saved", f"Use saved keystore: {cfg['path']} "
+                                  f"(alias {Colors.GREEN}{cfg['alias']}{Colors.END})"))
         opts.append(("existing", "Use an existing keystore file (pick alias after password)"))
         opts.append(("create", "Create a new keystore (step by step)"))
         opts.append(("debug", "Sign with the debug keystore (quick, not for Play Store)"))
 
-        print(f"{Colors.BOLD}Choose a signing keystore:{Colors.END}")
+        print(f"\n{Colors.BOLD}Choose a signing keystore:{Colors.END}")
         for i, (_, label) in enumerate(opts, 1):
             print(f"  {i}. {label}")
         print()
@@ -556,55 +622,37 @@ class TermuxStudio:
             return False
         action = opts[int(sel) - 1][0]
 
-        if action == "debug":
-            # studio CLI falls back to the debug keystore automatically.
-            parts = ["assembleRelease"] + name_args
-            return self.run_gradle_task(" ".join(shlex.quote(p) for p in parts))
-
+        ks = None  # None ⇒ debug keystore
         if action == "saved":
-            ks_path, store_pass = saved["path"], saved["store_pass"]
-            alias, key_pass = saved["alias"], saved["key_pass"]
-
+            ks = {"path": cfg["path"], "store_pass": cfg["store_pass"],
+                  "alias": cfg["alias"], "key_pass": cfg["key_pass"]}
         elif action == "create":
             created = self.create_keystore()
             if not created:
                 return False
-            ks_path, store_pass = created["path"], created["store_pass"]
-            alias, key_pass = created["alias"], created["key_pass"]
-            if input(f"\n{Colors.CYAN}Remember this keystore for next time? (y/N): {Colors.END}").strip().lower() == "y":
-                self.save_keystore({"path": ks_path, "store_pass": store_pass,
-                                    "alias": alias, "key_pass": key_pass})
-
-        else:  # existing
+            ks = created
+        elif action == "existing":
             print("\nEnter the path to your signing keystore (.jks/.keystore).")
             print("(Press TAB for path autocompletion)")
-            ks = input(f"{Colors.CYAN}Keystore path: {Colors.END}").strip()
-            if not ks:
+            ks_in = input(f"{Colors.CYAN}Keystore path: {Colors.END}").strip()
+            if not ks_in:
                 print(f"{Colors.RED}Keystore path is required.{Colors.END}")
                 return False
-            ks_path = os.path.abspath(os.path.expanduser(ks))
+            ks_path = os.path.abspath(os.path.expanduser(ks_in))
             if not os.path.isfile(ks_path):
                 print(f"\n{Colors.RED}Keystore not found: {ks_path}{Colors.END}")
                 return False
             store_pass = getpass.getpass("Keystore (store) password: ")
-            # Show the aliases inside the keystore and let the user pick one.
-            alias = self.select_alias(ks_path, store_pass)
+            alias = self.select_alias(ks_path, store_pass)  # lists aliases to pick from
             if not alias:
                 return False
             key_pass = getpass.getpass("Key password [Enter = same as store]: ") or store_pass
-            if input(f"\n{Colors.CYAN}Remember this keystore for next time? (y/N): {Colors.END}").strip().lower() == "y":
-                self.save_keystore({"path": ks_path, "store_pass": store_pass,
-                                    "alias": alias, "key_pass": key_pass})
+            ks = {"path": ks_path, "store_pass": store_pass, "alias": alias, "key_pass": key_pass}
 
-        parts = [
-            "assembleRelease",
-            "--keystore", ks_path,
-            "--ks-pass", store_pass,
-            "--ks-alias", alias,
-            "--key-pass", key_pass,
-        ] + name_args
-        task = " ".join(shlex.quote(p) for p in parts)
-        return self.run_gradle_task(task)
+        # Offer to remember (incl. a "skip prompts next time / direct build" level).
+        self._maybe_remember_release(ks, custom_name)
+
+        return self.run_gradle_task(self._release_task(ks, custom_name))
 
     def run_on_device(self):
         """Build, install and launch the app — delegates to `studio run`, which auto-adapts
