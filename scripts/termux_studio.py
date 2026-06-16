@@ -157,10 +157,13 @@ class TermuxStudio:
         env["ANDROID_SDK_ROOT"] = self.android_home
         env["JAVA_OPTS"] = "-Djava.net.preferIPv4Stack=true"
 
-        print(f"\n{Colors.YELLOW}Executing: {' '.join(cmd)}{Colors.END}\n")
+        print(f"\n{Colors.YELLOW}Executing: {' '.join(cmd)}{Colors.END}")
+        print(f"{Colors.CYAN}(press Ctrl-C to cancel the build){Colors.END}\n")
         self.status = f"Running {task_name}..."
-        
-        # Start command
+
+        # Start command in its own session so Ctrl-C can stop the whole gradle process tree
+        # (studio → gradle → workers), not just the python reader.
+        process = None
         try:
             process = subprocess.Popen(
                 cmd,
@@ -168,15 +171,16 @@ class TermuxStudio:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
-                env=env
+                env=env,
+                start_new_session=True,
             )
-            
+
             # Read stdout line by line and print
             while True:
                 line = process.stdout.readline()
                 if not line:
                     break
-                
+
                 # Highlight and print lines
                 clean_line = line.strip()
                 if "FAILED" in clean_line or "ERROR" in clean_line or "Exception" in clean_line:
@@ -189,9 +193,9 @@ class TermuxStudio:
                     print(f"{Colors.BOLD}{Colors.GREEN}{line}{Colors.END}", end="")
                 else:
                     print(line, end="")
-                    
+
             process.wait()
-            
+
             if process.returncode == 0:
                 self.status = f"{task_name} successful!"
                 print(f"\n{Colors.BOLD}{Colors.GREEN}✔ Command executed successfully!{Colors.END}")
@@ -200,11 +204,49 @@ class TermuxStudio:
                 self.status = f"{task_name} failed (exit code {process.returncode})"
                 print(f"\n{Colors.BOLD}{Colors.RED}✘ Command failed with exit code {process.returncode}!{Colors.END}")
                 return False
-                
+
+        except KeyboardInterrupt:
+            self._terminate_build(process)
+            self.status = "Build cancelled"
+            print(f"\n{Colors.BOLD}{Colors.YELLOW}■ Build cancelled.{Colors.END}")
+            return False
         except Exception as e:
             self.status = f"Execution error"
             print(f"\n{Colors.BOLD}{Colors.RED}Error executing command: {e}{Colors.END}")
             return False
+
+    @staticmethod
+    def _terminate_build(process):
+        """Stop a running build's whole process group (gradle + workers). Escalates
+        SIGINT → SIGTERM → SIGKILL across the group so no straggler (e.g. a background
+        worker that ignores SIGINT) is left behind."""
+        if not process or process.poll() is not None:
+            return
+        import signal
+        try:
+            pgid = os.getpgid(process.pid)
+        except Exception:
+            pgid = None
+
+        def sig_all(sig):
+            try:
+                if pgid is not None:
+                    os.killpg(pgid, sig)
+                else:
+                    process.send_signal(sig)
+            except Exception:
+                pass
+
+        for sig, wait in ((signal.SIGINT, 4), (signal.SIGTERM, 4), (signal.SIGKILL, 3)):
+            sig_all(sig)
+            try:
+                process.wait(timeout=wait)
+            except Exception:
+                continue
+            # parent is gone; still SIGKILL the group once more to clear any stragglers.
+            if sig is not signal.SIGKILL:
+                sig_all(signal.SIGKILL)
+            return
 
     def create_new_project(self):
         self.print_header()
@@ -215,7 +257,10 @@ class TermuxStudio:
         print("\nTemplate:")
         print(f"  1. {Colors.GREEN}Jetpack Compose{Colors.END} (modern Kotlin UI)")
         print(f"  2. {Colors.GREEN}Views / XML{Colors.END} (AppCompat + layouts + ViewBinding)")
+        print("  0. Cancel")
         t = input(f"{Colors.CYAN}Choice (1/2): {Colors.END}").strip()
+        if t == "0":
+            return
         template = "--compose" if t == "1" else "--xml" if t == "2" else None
         if not template:
             print(f"{Colors.RED}Invalid template.{Colors.END}"); time.sleep(1.5); return
@@ -543,10 +588,15 @@ class TermuxStudio:
         """Create a brand-new release keystore step by step (path, passwords, alias, and
         certificate identity). Returns signing details dict, or None on failure/cancel."""
         self.print_header()
-        print(f"{Colors.BOLD}Create a New Release Keystore{Colors.END}\n")
+        print(f"{Colors.BOLD}Create a New Release Keystore{Colors.END}")
+        print(f"{Colors.CYAN}(type 0 at the path prompt to cancel){Colors.END}\n")
         default_dir = os.path.join(os.path.expanduser("~"), "keystores")
         default_path = os.path.join(default_dir, "release.jks")
-        path = input(f"{Colors.CYAN}New keystore path [{default_path}]: {Colors.END}").strip() or default_path
+        path_in = input(f"{Colors.CYAN}New keystore path [{default_path}]: {Colors.END}").strip()
+        if path_in == "0":
+            print(f"{Colors.YELLOW}Cancelled.{Colors.END}")
+            return None
+        path = path_in or default_path
         ks_path = os.path.abspath(os.path.expanduser(path))
         if os.path.exists(ks_path):
             print(f"{Colors.RED}A file already exists at {ks_path} — choose another path.{Colors.END}")
@@ -626,8 +676,12 @@ class TermuxStudio:
         print(f"\n{Colors.BOLD}Choose a signing keystore:{Colors.END}")
         for i, (_, label) in enumerate(opts, 1):
             print(f"  {i}. {label}")
+        print("  0. Cancel")
         print()
-        sel = input(f"{Colors.CYAN}Choice (1-{len(opts)}): {Colors.END}").strip()
+        sel = input(f"{Colors.CYAN}Choice (0-{len(opts)}): {Colors.END}").strip()
+        if sel == "0":
+            print(f"{Colors.YELLOW}Cancelled.{Colors.END}")
+            return False
         if not (sel.isdigit() and 1 <= int(sel) <= len(opts)):
             print(f"{Colors.RED}Invalid choice.{Colors.END}")
             return False
@@ -674,7 +728,16 @@ class TermuxStudio:
             print(f"{Colors.RED}Please load a project first!{Colors.END}")
             time.sleep(1.5)
             return
-        variant = input(f"{Colors.CYAN}Variant [debug/release] (default debug): {Colors.END}").strip().lower()
+        print(f"{Colors.BOLD}Variant:{Colors.END}")
+        print(f"  1. {Colors.GREEN}Debug{Colors.END} (default)")
+        print("  2. Release")
+        print("  0. Cancel")
+        v = input(f"{Colors.CYAN}Choice [1]: {Colors.END}").strip() or "1"
+        if v == "0":
+            return
+        if v not in ("1", "2"):
+            print(f"{Colors.RED}Invalid choice.{Colors.END}"); time.sleep(1.2); return
+        variant = "release" if v == "2" else "debug"
         want_log = input(f"{Colors.CYAN}Stream logcat after launch? (y/N): {Colors.END}").strip().lower() == "y"
         cmd = ["studio", "run", self.project_path]
         if variant == "release":
