@@ -1,0 +1,964 @@
+#!/data/data/com.termux/files/usr/bin/bash
+#
+# Termux Studio — Android project controller for Termux
+#
+# Builds Android Studio projects on-device without disturbing their Studio config.
+# Termux-only adjustments (native aapt2 override, JDK pin) live in ~/.gradle and are
+# applied transparently; the project's Android Studio config is left committed to git.
+#
+# Commands: new, load, build, git/push, start, stop, status, clean-cache, env, doctor, help
+
+set -o pipefail
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+CYAN='\033[0;36m'; BLUE='\033[0;34m'; BOLD='\033[1m'; NC='\033[0m'
+
+STUDIO_DIR="/data/data/com.termux/files/home/.studio"
+STUDIO_PY="/data/data/com.termux/files/home/termux_studio.py"
+NEW_PY="$STUDIO_DIR/studio_new.py"
+COMPAT_PY="$STUDIO_DIR/studio_compat.py"
+SDK_DIR="${ANDROID_HOME:-/data/data/com.termux/files/home/android-sdk}"
+JAVA_HOME_DEFAULT="/data/data/com.termux/files/usr/lib/jvm/java-21-openjdk"
+JVM_DIR="/data/data/com.termux/files/usr/lib/jvm"   # where Termux openjdk-* install
+JDK_PIN_DIR="$STUDIO_DIR/jdk"                        # per-project JDK pins (out of repo)
+DAEMON_JVM_REL="gradle/gradle-daemon-jvm.properties"
+# Persisted across runs so 'studio run'/'logcat' can silently reconnect wireless adb.
+ADB_PORT_FILE="$STUDIO_DIR/adb_connect_port"   # last successful wireless connect port
+LAST_PKG_FILE="$STUDIO_DIR/last_pkg"           # package of the last 'studio run' (for logcat)
+
+info()  { echo -e "${CYAN}$*${NC}"; }
+ok()    { echo -e "${GREEN}✔ $*${NC}"; }
+warn()  { echo -e "${YELLOW}! $*${NC}"; }
+err()   { echo -e "${RED}✘ $*${NC}" >&2; }
+
+# ----------------------------------------------------------------- helpers
+
+# Resolve a project directory: explicit arg, else current dir. Validates gradle project.
+resolve_project() {
+    local p="${1:-$PWD}"
+    p="$(cd "$p" 2>/dev/null && pwd)" || { err "no such directory: $1"; return 1; }
+    if [ ! -f "$p/build.gradle" ] && [ ! -f "$p/build.gradle.kts" ] && [ ! -f "$p/settings.gradle" ] && [ ! -f "$p/settings.gradle.kts" ]; then
+        err "not a Gradle project (no build.gradle/settings.gradle): $p"
+        return 1
+    fi
+    echo "$p"
+}
+
+ensure_local_props() {
+    local proj="$1"
+    if [ ! -f "$proj/local.properties" ]; then
+        echo "sdk.dir=$SDK_DIR" > "$proj/local.properties"
+        ok "wrote local.properties (sdk.dir=$SDK_DIR; git-ignored)"
+    fi
+}
+
+# Where the Studio daemon-JVM file is stashed during a Termux build. Kept OUTSIDE the
+# project so the repo (and its Android Studio config) is never modified.
+stash_path() {
+    local proj="$1"
+    local key
+    key=$(echo "$proj" | sed 's#[/ ]#_#g')
+    mkdir -p "$STUDIO_DIR/daemon-jvm-stash"
+    echo "$STUDIO_DIR/daemon-jvm-stash/$key.bak"
+}
+
+# Restore the Studio daemon-JVM file if a previous (e.g. interrupted) build left it stashed.
+restore_daemon_jvm() {
+    local proj="$1"
+    local bak; bak="$(stash_path "$proj")"
+    if [ -f "$bak" ] && [ ! -f "$proj/$DAEMON_JVM_REL" ]; then
+        mkdir -p "$proj/gradle"
+        mv -f "$bak" "$proj/$DAEMON_JVM_REL"
+        ok "restored $DAEMON_JVM_REL (Android Studio config)"
+    fi
+}
+
+check_global_gradle() {
+    local gp="$HOME/.gradle/gradle.properties"
+    if ! grep -q "aapt2FromMavenOverride" "$gp" 2>/dev/null; then
+        warn "no aapt2 override in ~/.gradle/gradle.properties — SDK 35+ resource linking may fail."
+    fi
+}
+
+# Ensure the standard Android debug keystore exists and print its path on stdout.
+# (Progress/error notes go to stderr so callers can capture the path cleanly.)
+# Used to sign release APKs when the user supplies no keystore of their own, so the
+# release APK is installable instead of being left unsigned.
+ensure_debug_keystore() {
+    local ks="$HOME/.android/debug.keystore"
+    if [ -f "$ks" ]; then echo "$ks"; return 0; fi
+    local kt; kt="$(command -v keytool || echo "$JAVA_HOME_DEFAULT/bin/keytool")"
+    [ -x "$kt" ] || { err "keytool not found; cannot create a debug keystore"; return 1; }
+    mkdir -p "$HOME/.android"
+    info "creating debug keystore at $ks" >&2
+    "$kt" -genkeypair -keystore "$ks" -storepass android -keypass android \
+        -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 \
+        -dname "CN=Android Debug,O=Android,C=US" >/dev/null 2>&1 \
+        || { err "failed to create debug keystore"; return 1; }
+    echo "$ks"
+}
+
+# Give signed release APKs a human, self-describing name so a shared file says what it is:
+#   app-release.apk  ->  <App Label>_<versionName>.apk   (spaces in the label become "_").
+# Reads the label + versionName straight from the APK via the native aapt2 (same source AS
+# uses). Prints each new path on stdout. Gradle re-creates app-release.apk on the next build,
+# so this never accumulates duplicates for the same version.
+rename_release_apks() {
+    local proj="$1"
+    local a2; a2="$(aapt2_bin)"
+    [ -n "$a2" ] && [ -x "$a2" ] || return 0
+    local apk
+    while IFS= read -r apk; do
+        [ -n "$apk" ] || continue
+        local badging label ver
+        badging="$("$a2" dump badging "$apk" 2>/dev/null)"
+        label="$(sed -n "s/^application-label:'\([^']*\)'.*/\1/p" <<<"$badging" | head -n1)"
+        [ -z "$label" ] && label="$(sed -n "s/^application-label-[^:]*:'\([^']*\)'.*/\1/p" <<<"$badging" | head -n1)"
+        ver="$(sed -n "s/.* versionName='\([^']*\)'.*/\1/p" <<<"$badging" | head -n1)"
+        [ -z "$label" ] && continue
+        # Sanitise for a filename: spaces -> "_", drop anything not alnum/._-.
+        local clean; clean="$(echo "$label" | tr ' ' '_' | tr -cd '[:alnum:]._-')"
+        [ -z "$clean" ] && continue
+        local vclean; vclean="$(echo "$ver" | tr ' ' '_' | tr -cd '[:alnum:]._-')"
+        local newname="$clean"; [ -n "$vclean" ] && newname="${clean}_${vclean}"
+        local dir target; dir="$(dirname "$apk")"; target="$dir/${newname}.apk"
+        [ "$apk" = "$target" ] && continue
+        mv -f "$apk" "$target" && echo "$target"
+    done < <(find "$proj" -path "*/build/outputs/apk/release/*-release.apk" -type f ! -name '*-unsigned.apk' 2>/dev/null)
+}
+
+# ----------------------------------------------------------------- JDK management
+#
+# Imported projects target different toolchains: AGP 8/9 needs JDK 17+, AGP 7 needs 11,
+# very old AGP needs 8. Termux can install openjdk 11/17/21 natively; 8 is not packaged for
+# aarch64 (only a glibc proot can provide it). We keep all installed JDKs side by side under
+# $JVM_DIR and let a build pick one — globally (~/.gradle pin) or per project (out-of-repo
+# pin), overriding via -Dorg.gradle.java.home so the repo is never touched.
+
+# Resolve the install dir for a major version (e.g. 17 -> .../java-17-openjdk). Prints path.
+jdk_dir_for() {
+    local v="$1" d
+    d="$JVM_DIR/java-${v}-openjdk"
+    [ -x "$d/bin/java" ] && { echo "$d"; return 0; }
+    d="$(ls -d "$JVM_DIR"/java-${v}* 2>/dev/null | head -n1)"
+    [ -n "$d" ] && [ -x "$d/bin/java" ] && { echo "$d"; return 0; }
+    return 1
+}
+
+# Turn a --jdk/use argument (major version OR an absolute JAVA_HOME path) into a JAVA_HOME.
+jdk_resolve() {
+    local a="$1"
+    if [ -d "$a" ] && [ -x "$a/bin/java" ]; then
+        echo "$a"; return 0
+    elif [[ "$a" =~ ^[0-9]+$ ]]; then
+        jdk_dir_for "$a"; return $?
+    fi
+    return 1
+}
+
+# Print the version string for a JAVA_HOME (e.g. "21.0.11").
+jdk_version() {
+    "$1/bin/java" -version 2>&1 | sed -n 's/.*version "\([^"]*\)".*/\1/p' | head -n1
+}
+
+jdk_pin_file() {  # per-project JDK pin path (same key scheme as the daemon-JVM stash)
+    local key; key=$(echo "$1" | sed 's#[/ ]#_#g')
+    echo "$JDK_PIN_DIR/$key"
+}
+
+# Decide which JAVA_HOME a build should use:
+#   --jdk override > per-project pin > compat auto-recommendation > "" (global ~/.gradle pin).
+# Prints the path (may be empty).
+resolve_build_jdk() {
+    local proj="$1" override="$2" suggest="$3" pf
+    if [ -n "$override" ]; then jdk_resolve "$override"; return $?; fi
+    pf="$(jdk_pin_file "$proj")"
+    if [ -f "$pf" ]; then
+        local p; p="$(cat "$pf")"
+        [ -d "$p" ] && [ -x "$p/bin/java" ] && { echo "$p"; return 0; }
+    fi
+    # Auto-recommendation from studio_compat (a major version it picked for this toolchain).
+    [ -n "$suggest" ] && jdk_dir_for "$suggest" && return 0
+    return 0   # empty -> use whatever ~/.gradle/gradle.properties pins
+}
+
+jdk_list() {
+    echo -e "${CYAN}===== INSTALLED JDKs =====${NC}"
+    local def; def="$(grep -h org.gradle.java.home ~/.gradle/gradle.properties 2>/dev/null | cut -d= -f2)"
+    [ -z "$def" ] && def="$JAVA_HOME_DEFAULT"
+    local found=0 d
+    for d in "$JVM_DIR"/*/; do
+        d="${d%/}"; [ -x "$d/bin/java" ] || continue
+        found=1
+        local mark=""; [ "$d" = "$def" ] && mark=" ${GREEN}(default)${NC}"
+        echo -e "  ${BOLD}$(basename "$d")${NC}  -> $(jdk_version "$d")${mark}"
+        echo -e "     ${CYAN}$d${NC}"
+    done
+    [ "$found" = "0" ] && warn "no JDKs found under $JVM_DIR"
+    echo
+    echo -e "Installable natively: ${GREEN}openjdk-11 / -17 / -21 / -25${NC} (pkg). ${YELLOW}Java 8 is not"
+    echo -e "packaged for Termux aarch64${NC} — use 'studio jdk install 8' for the proot route."
+}
+
+jdk_install() {
+    local v="$1"
+    [ -z "$v" ] && { err "usage: studio jdk install <8|11|17|21|25>"; return 1; }
+    if jdk_dir_for "$v" >/dev/null; then ok "openjdk-$v already installed ($(jdk_dir_for "$v"))"; return 0; fi
+    case "$v" in
+        11|17|21|25)
+            info "Installing openjdk-$v via pkg…"
+            pkg install -y "openjdk-$v" || { err "pkg install openjdk-$v failed"; return 1; }
+            jdk_dir_for "$v" >/dev/null && ok "openjdk-$v installed: $(jdk_dir_for "$v")" \
+                || warn "installed, but couldn't locate java-${v}-openjdk under $JVM_DIR"
+            ;;
+        8)
+            warn "Java 8 is not packaged for Termux (aarch64/bionic)."
+            echo -e "Options for a project that truly needs JDK 8 to run Gradle:"
+            echo -e "  1) Preferred: keep building on JDK 17/21 and set Java 8 ${BOLD}bytecode${NC} in the"
+            echo -e "     module — sourceCompatibility/targetCompatibility = VERSION_1_8 (or a Java"
+            echo -e "     toolchain). Modern Gradle compiles for 8 while running on 17/21."
+            echo -e "  2) Glibc JDK 8 inside proot-distro (cannot drive the native Termux gradle):"
+            echo -e "       ${CYAN}proot-distro install debian${NC}"
+            echo -e "       ${CYAN}proot-distro login debian -- apt-get install -y openjdk-8-jdk${NC}"
+            return 1
+            ;;
+        *) err "unsupported version: $v (try 11, 17, 21, 25)"; return 1 ;;
+    esac
+}
+
+jdk_use() {
+    # studio jdk use <version|path> [project-dir]
+    #   no project dir  -> set the GLOBAL default (~/.gradle/gradle.properties pin)
+    #   project dir      -> pin just that project (out-of-repo)
+    local sel="$1" where="${2:-}"
+    [ -z "$sel" ] && { err "usage: studio jdk use <8|11|17|21|25|/path> [project-dir]"; return 1; }
+    local jh; jh="$(jdk_resolve "$sel")" || { err "JDK not found: $sel (install it with 'studio jdk install $sel')"; return 1; }
+
+    if [ -n "$where" ]; then
+        local proj; proj="$(resolve_project "$where")" || return 1
+        mkdir -p "$JDK_PIN_DIR"
+        echo "$jh" > "$(jdk_pin_file "$proj")"
+        ok "pinned JDK for $(basename "$proj"): $(jdk_version "$jh")  ($jh)"
+        echo -e "  (stored out-of-repo in $JDK_PIN_DIR — git/Studio config untouched)"
+    else
+        local gp="$HOME/.gradle/gradle.properties"; mkdir -p "$HOME/.gradle"; touch "$gp"
+        if grep -q '^org.gradle.java.home=' "$gp"; then
+            sed -i "s#^org.gradle.java.home=.*#org.gradle.java.home=$jh#" "$gp"
+        else
+            echo "org.gradle.java.home=$jh" >> "$gp"
+        fi
+        ok "default build JDK set to $(jdk_version "$jh")  ($jh)"
+    fi
+}
+
+jdk_which() {
+    local proj; proj="$(resolve_project "${1:-$PWD}" 2>/dev/null)" || proj="${1:-$PWD}"
+    local jh; jh="$(resolve_build_jdk "$proj" "")"
+    if [ -n "$jh" ]; then
+        info "This project would build with the PINNED JDK: $(jdk_version "$jh") ($jh)"
+    else
+        local def; def="$(grep -h org.gradle.java.home ~/.gradle/gradle.properties 2>/dev/null | cut -d= -f2)"
+        [ -z "$def" ] && def="$JAVA_HOME_DEFAULT"
+        info "This project would build with the DEFAULT JDK: $(jdk_version "$def") ($def)"
+    fi
+}
+
+studio_jdk() {
+    local sub="${1:-list}"; shift 2>/dev/null
+    case "$sub" in
+        list|ls|"")     jdk_list ;;
+        install|add|i)  jdk_install "$@" ;;
+        use|set)        jdk_use "$@" ;;
+        which|current)  jdk_which "$@" ;;
+        *) err "usage: studio jdk {list|install <ver>|use <ver> [project]|which [project]}"; return 1 ;;
+    esac
+}
+
+# ----------------------------------------------------------------- build
+
+studio_build() {
+    local proj tasks=()
+    local first="${1:-}"
+    if [ -n "$first" ] && [ -d "$first" ]; then
+        proj="$(resolve_project "$first")" || return 1
+        shift
+    else
+        proj="$(resolve_project "$PWD")" || return 1
+    fi
+    # Separate keystore/signing flags from the Gradle tasks. Everything that isn't a
+    # signing flag is forwarded verbatim to Gradle.
+    local ks_file="" ks_pass="" ks_alias="" key_pass="" jdk_override=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --keystore|--ks)        ks_file="$2"; shift 2 ;;
+            --ks-pass|--store-pass) ks_pass="$2"; shift 2 ;;
+            --ks-alias|--alias)     ks_alias="$2"; shift 2 ;;
+            --key-pass)             key_pass="$2"; shift 2 ;;
+            --jdk|--java)           jdk_override="$2"; shift 2 ;;
+            *)                      tasks+=("$1"); shift ;;
+        esac
+    done
+    [ ${#tasks[@]} -eq 0 ] && tasks=(":app:assembleDebug")
+
+    # For release builds, sign the APK via AGP's injected signing properties (the same
+    # mechanism Android Studio uses) — no change to the project's build.gradle. Falls back
+    # to the debug keystore when the user supplies none, so the release APK is installable.
+    local sign_props=()
+    if printf '%s\n' "${tasks[@]}" | grep -qi 'release'; then
+        if [ -z "$ks_file" ]; then
+            ks_file="$(ensure_debug_keystore)" || return 1
+            ks_pass="android"; ks_alias="androiddebugkey"; key_pass="android"
+            warn "no keystore given — signing release APK with the debug keystore ($ks_file)"
+        else
+            ks_file="${ks_file/#\~/$HOME}"
+            ks_file="$(cd "$(dirname "$ks_file")" 2>/dev/null && pwd)/$(basename "$ks_file")"
+            [ -f "$ks_file" ] || { err "keystore not found: $ks_file"; return 1; }
+            [ -z "$key_pass" ] && key_pass="$ks_pass"
+            info "signing release APK with keystore: $ks_file (alias: ${ks_alias:-?})"
+        fi
+        sign_props=(
+            "-Pandroid.injected.signing.store.file=$ks_file"
+            "-Pandroid.injected.signing.store.password=$ks_pass"
+            "-Pandroid.injected.signing.key.alias=$ks_alias"
+            "-Pandroid.injected.signing.key.password=$key_pass"
+        )
+    fi
+
+    check_global_gradle
+    ensure_local_props "$proj"
+
+    # Temporarily move the Studio daemon-JVM pin aside (it forces a JetBrains JDK that
+    # Termux lacks and trips Gradle's native arch lookup). Restored on exit so git keeps it.
+    local djvm="$proj/$DAEMON_JVM_REL"
+    local bak; bak="$(stash_path "$proj")"
+    local moved=0
+    # Restore daemon-JVM pin AND revert any reversible compatibility patches (SDK cap,
+    # AGP bump, dropped buildTools pin) so the repo always ends a build pristine.
+    _restore() {
+        if [ "$moved" = "1" ] && [ -f "$bak" ]; then mkdir -p "$proj/gradle"; mv -f "$bak" "$djvm"; fi
+        [ -f "$COMPAT_PY" ] && python3 "$COMPAT_PY" "$proj" --restore >/dev/null 2>&1 || true
+    }
+    trap _restore EXIT INT TERM
+    if [ -f "$djvm" ]; then
+        mv -f "$djvm" "$bak"
+        moved=1
+        info "temporarily disabled Studio daemon-JVM pin for this build (restored after)"
+    fi
+
+    # Auto-adapt imported projects to this device's toolchain (Gradle version, SDK levels,
+    # AGP). studio_compat prints all notes to stderr and the launcher to choose on stdout.
+    local gradle_bin="gradle" compat_jdk=""
+    if [ -f "$COMPAT_PY" ]; then
+        local cout cline
+        cout="$(ANDROID_HOME="$SDK_DIR" python3 "$COMPAT_PY" "$proj" --prepare --sdk "$SDK_DIR")"
+        while IFS= read -r cline; do
+            case "$cline" in
+                GRADLE_BIN=*) gradle_bin="${cline#GRADLE_BIN=}" ;;
+                JDK_MAJOR=*)  compat_jdk="${cline#JDK_MAJOR=}" ;;
+            esac
+        done <<< "$cout"
+    fi
+
+    # Pick the JDK for this build: --jdk override > per-project pin > the global ~/.gradle pin.
+    # When one is selected we pass -Dorg.gradle.java.home (overrides gradle.properties) and set
+    # JAVA_HOME, so the repo's own config is never touched.
+    local jdk_home jdk_props=() jdk_env=()
+    jdk_home="$(resolve_build_jdk "$proj" "$jdk_override" "$compat_jdk")"
+    if [ -n "$jdk_override" ] && [ -z "$jdk_home" ]; then
+        err "requested JDK not found: $jdk_override (try 'studio jdk install $jdk_override')"; _restore; trap - EXIT INT TERM; return 1
+    fi
+    if [ -n "$jdk_home" ]; then
+        jdk_props=("-Dorg.gradle.java.home=$jdk_home")
+        jdk_env=("JAVA_HOME=$jdk_home")
+        info "Using JDK $(jdk_version "$jdk_home") ($jdk_home)"
+    fi
+
+    info "Building ${BOLD}${tasks[*]}${NC}${CYAN} in $proj"
+    [ "$gradle_bin" != "gradle" ] && info "  (using $gradle_bin)"
+    echo
+    ( cd "$proj" && \
+      env "${jdk_env[@]}" ANDROID_HOME="$SDK_DIR" ANDROID_SDK_ROOT="$SDK_DIR" \
+      "$gradle_bin" "${tasks[@]}" "${sign_props[@]}" "${jdk_props[@]}" --no-daemon --console=plain )
+    local rc=$?
+
+    _restore; trap - EXIT INT TERM
+
+    echo
+    if [ $rc -eq 0 ]; then
+        ok "build successful"
+        # For release builds, rename app-release.apk -> <App Label>_<version>.apk.
+        if printf '%s\n' "${tasks[@]}" | grep -qi 'release'; then
+            rename_release_apks "$proj" >/dev/null
+        fi
+        local apks
+        apks=$(find "$proj" -path "*/build/outputs/apk/*.apk" 2>/dev/null)
+        if [ -n "$apks" ]; then
+            echo -e "${BOLD}APK(s):${NC}"
+            echo "$apks" | while read -r a; do
+                echo -e "  ${GREEN}$a${NC} ($(du -h "$a" | cut -f1))"
+            done
+        fi
+    else
+        err "build failed (exit $rc)"
+    fi
+    return $rc
+}
+
+# ----------------------------------------------------------------- run (build + install + launch)
+
+# Resolve the on-device aapt2 (used to read the package name + launcher activity from the APK).
+aapt2_bin() {
+    local ov; ov=$(grep -h aapt2FromMavenOverride ~/.gradle/gradle.properties 2>/dev/null | cut -d= -f2)
+    if [ -n "$ov" ] && [ -x "$ov" ]; then echo "$ov"; return; fi
+    command -v aapt2
+}
+
+# Is an adb device actually connected and ready (state "device", not offline/unauthorized)?
+adb_device_ready() {
+    command -v adb >/dev/null || return 1
+    [ "$(adb get-state 2>/dev/null)" = "device" ]
+}
+
+# ----------------------------------------------------------------- wireless adb (Android 11+)
+#
+# On Android 11+ the device can debug itself over loopback ("Wireless debugging"): we pair
+# once with a code, then `adb connect localhost:PORT`. This gives a *real* install/launch/
+# logcat pipeline on a plain (non-root) Termux — unlike termux-open, which only hands the
+# APK to the package-installer UI and cannot tell whether the user actually installed it.
+
+# Print "host:port" for an adb-over-TLS mDNS service. $1 = connect|pairing.
+adb_mdns_endpoint() {
+    adb mdns services 2>/dev/null | grep "_adb-tls-${1}._tcp" \
+        | grep -oE '[0-9.]+:[0-9]+' | head -n1
+}
+
+# Best-effort: open the device's Developer options so the user can reach Wireless debugging.
+open_dev_settings() {
+    am start -a android.settings.APPLICATION_DEVELOPMENT_SETTINGS >/dev/null 2>&1 \
+        || am start -a android.settings.SETTINGS >/dev/null 2>&1 || true
+}
+
+adb_status() {
+    command -v adb >/dev/null || { err "adb not found (pkg install android-tools)"; return 1; }
+    local st; st="$(adb devices 2>/dev/null | grep -vE '^List of|^$')"
+    if [ -n "$st" ]; then
+        ok "adb devices:"; echo "$st" | sed 's/^/  /'
+    else
+        warn "no adb devices — run 'studio adb pair' (first time) or 'studio adb connect'"
+    fi
+}
+
+# Connect (or reconnect) wireless adb. $1 optional "host:port" or bare port; otherwise it
+# tries mDNS discovery, then the last successful port saved in $ADB_PORT_FILE.
+adb_connect() {
+    command -v adb >/dev/null || { err "adb not found (pkg install android-tools)"; return 1; }
+    adb start-server >/dev/null 2>&1
+    adb_device_ready && return 0     # already connected — nothing to do
+
+    local hp="${1:-}"
+    if [ -z "$hp" ]; then
+        hp="$(adb_mdns_endpoint connect)"
+        [ -z "$hp" ] && [ -f "$ADB_PORT_FILE" ] && hp="localhost:$(cat "$ADB_PORT_FILE")"
+    elif [[ "$hp" != *:* ]]; then
+        hp="localhost:$hp"
+    fi
+    [ -z "$hp" ] && { err "no connect endpoint known — run 'studio adb pair' first"; return 1; }
+
+    local out; out="$(adb connect "$hp" 2>&1)"
+    if echo "$out" | grep -qiE "connected to"; then
+        echo "${hp##*:}" > "$ADB_PORT_FILE"
+        ok "wireless adb connected ($hp)"
+        return 0
+    fi
+    return 1
+}
+
+# First-time pairing for Wireless debugging, then connect.
+adb_pair() {
+    command -v adb >/dev/null || { err "adb not found (pkg install android-tools)"; return 1; }
+    adb start-server >/dev/null 2>&1
+    info "${BOLD}Wireless debugging pairing${NC}${CYAN} (Android 11+)"
+    echo "  1) Settings → Developer options → ${BOLD}Wireless debugging${NC} → turn ON"
+    echo "  2) Tap ${BOLD}Pair device with pairing code${NC} — note the IP:PORT and 6-digit code"
+    echo "     (On MIUI/HyperOS also enable 'Install via USB' / 'USB debugging (Security settings)')"
+    open_dev_settings
+    echo
+
+    local pair_ep code
+    pair_ep="$(adb_mdns_endpoint pairing)"
+    if [ -n "$pair_ep" ]; then
+        info "mDNS found a pairing endpoint: $pair_ep"
+    else
+        read -rp "$(echo -e "${CYAN}Pairing IP:PORT from the dialog: ${NC}")" pair_ep
+    fi
+    [ -z "$pair_ep" ] && { err "pairing endpoint required"; return 1; }
+    read -rp "$(echo -e "${CYAN}6-digit pairing code: ${NC}")" code
+    [ -z "$code" ] && { err "pairing code required"; return 1; }
+
+    # Loopback works even though the dialog shows the LAN IP; fall back to the shown address.
+    info "Pairing…"
+    if adb pair "localhost:${pair_ep##*:}" "$code" || adb pair "$pair_ep" "$code"; then
+        ok "paired"
+        # The connect port differs from the pairing port; discover it (mDNS) and connect.
+        sleep 1
+        adb_connect || { warn "paired but not yet connected — open Wireless debugging and run:"; \
+                         echo "    studio adb connect <PORT shown under 'IP address & Port'>"; return 1; }
+        adb_status
+    else
+        err "pairing failed — double-check the code/port (they expire quickly; reopen the dialog)"
+        return 1
+    fi
+}
+
+studio_adb() {
+    local sub="${1:-status}"; shift 2>/dev/null
+    case "$sub" in
+        pair)            adb_pair "$@" ;;
+        connect|c)       adb_connect "$@" && adb_status ;;
+        disconnect|d)    adb disconnect >/dev/null 2>&1; ok "wireless adb disconnected" ;;
+        status|state|s)  adb_status ;;
+        logcat|log)      studio_logcat "$@" ;;
+        *) err "usage: studio adb {pair|connect [port]|disconnect|status|logcat}" ; return 1 ;;
+    esac
+}
+
+# ----------------------------------------------------------------- install verification
+#
+# Confirm an install actually completed, *without* trusting termux-open's return code.
+# The installed base.apk lives under /data/app/~~<random>==/<pkg>-<random>==/ and that
+# random path changes on every (re)install — so when `pm path` differs from the snapshot
+# taken before we launched the installer, the install really happened. This is what makes
+# a backgrounded/minimized Termux report the truth instead of a premature "success".
+pkg_apk_path() { pm path "$1" 2>/dev/null | sed -n 's/^package://p' | head -n1; }
+
+wait_for_install() {   # $1 pkg, $2 path-before, $3 timeout-seconds (default 300)
+    local pkg="$1" prev="$2" timeout="${3:-300}" i=0 cur
+    while [ "$i" -lt "$timeout" ]; do
+        cur="$(pkg_apk_path "$pkg")"
+        [ -n "$cur" ] && [ "$cur" != "$prev" ] && return 0
+        sleep 2; i=$((i+2)); printf '.' >&2
+    done
+    return 1
+}
+
+# ----------------------------------------------------------------- logcat (debug logs)
+
+studio_logcat() {
+    # studio logcat [pkg | project-path] [-- <extra adb logcat args>]
+    command -v adb >/dev/null || { err "adb not found (pkg install android-tools)"; return 1; }
+    if ! adb_device_ready; then
+        info "no adb device — trying wireless connect…"
+        adb_connect >/dev/null 2>&1 || { err "connect adb first:  studio adb pair"; return 1; }
+    fi
+
+    local arg="" pkg="" extra=()
+    if [ "${1:-}" != "--" ]; then arg="${1:-}"; shift 2>/dev/null; fi
+    if [ "${1:-}" = "--" ]; then shift; extra=("$@"); fi
+
+    if [ -n "$arg" ] && [ -d "$arg" ]; then
+        # A project path → read the package from its freshest APK via aapt2.
+        local a2 apk; a2="$(aapt2_bin)"
+        apk="$(find "$arg" -path '*/build/outputs/apk/*.apk' -type f ! -name '*-unsigned.apk' 2>/dev/null \
+               | xargs -r ls -t 2>/dev/null | head -n1)"
+        [ -n "$a2" ] && [ -n "$apk" ] && pkg="$("$a2" dump badging "$apk" 2>/dev/null \
+               | sed -n "s/^package: name='\([^']*\)'.*/\1/p" | head -n1)"
+    elif [ -n "$arg" ]; then
+        pkg="$arg"
+    elif [ -f "$LAST_PKG_FILE" ]; then
+        pkg="$(cat "$LAST_PKG_FILE")"
+    fi
+    [ -z "$pkg" ] && { err "which app? pass a package name or project path (or run 'studio run' first)"; return 1; }
+
+    adb logcat -c >/dev/null 2>&1 || true   # clear backlog so we only see fresh logs
+    local pid; pid="$(adb shell pidof "$pkg" 2>/dev/null | tr -d '\r' | awk '{print $1}')"
+    info "Logcat for ${BOLD}$pkg${NC}${CYAN} — Ctrl-C to stop"
+    if [ -n "$pid" ]; then
+        adb logcat --pid="$pid" "${extra[@]}"
+    else
+        warn "$pkg is not running yet — streaming a name-filtered log; launch the app to see output"
+        adb logcat "${extra[@]}" | grep --line-buffered -iE "$pkg|AndroidRuntime|FATAL"
+    fi
+}
+
+studio_run() {
+    # studio run [path] [--release] [--no-launch] [--logcat] [extra gradle tasks...]
+    local proj="" variant="debug" launch=1 tail_log=0 extra=()
+    local first="${1:-}"
+    if [ -n "$first" ] && [ -d "$first" ]; then proj="$first"; shift; fi
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --release)   variant="release" ;;
+            --debug)     variant="debug" ;;
+            --no-launch) launch=0 ;;
+            --logcat|--log) tail_log=1 ;;
+            *)           extra+=("$1") ;;
+        esac
+        shift
+    done
+    proj="$(resolve_project "${proj:-$PWD}")" || return 1
+
+    # 1) Assemble. Capitalise the variant for the Gradle task (assembleDebug/assembleRelease).
+    local cap="$(tr '[:lower:]' '[:upper:]' <<<"${variant:0:1}")${variant:1}"
+    studio_build "$proj" ":app:assemble${cap}" "${extra[@]}" || return 1
+
+    # 2) Locate the freshest *installable* APK for this variant. Prefer a signed APK and
+    #    skip any leftover *-unsigned.apk — the package installer rejects unsigned APKs,
+    #    which is the usual cause of "App not installed" on a release run.
+    local apk
+    apk="$(find "$proj" -path "*/build/outputs/apk/${variant}/*.apk" -type f \
+            ! -name '*-unsigned.apk' 2>/dev/null \
+            | xargs -r ls -t 2>/dev/null | head -n1)"
+    if [ -z "$apk" ]; then
+        # Nothing signed found — surface a clear reason rather than silently failing later.
+        local unsigned
+        unsigned="$(find "$proj" -path "*/build/outputs/apk/${variant}/*-unsigned.apk" -type f 2>/dev/null | head -n1)"
+        if [ -n "$unsigned" ]; then
+            err "only an unsigned ${variant} APK was produced — it cannot be installed."
+            warn "re-run with a keystore (--keystore FILE --ks-pass PW --ks-alias A),"
+            warn "or use the release variant, which auto-signs with the debug keystore."
+        else
+            err "no ${variant} APK found under build/outputs/apk/${variant}/"
+        fi
+        return 1
+    fi
+    echo
+    ok "APK: $apk ($(du -h "$apk" | cut -f1))"
+
+    # 3) Read package + launchable activity straight from the APK (like AS does internally).
+    local pkg act badging a2; a2="$(aapt2_bin)"
+    if [ -n "$a2" ] && [ -x "$a2" ]; then
+        badging="$("$a2" dump badging "$apk" 2>/dev/null)"
+        pkg="$(sed -n "s/^package: name='\([^']*\)'.*/\1/p" <<<"$badging" | head -n1)"
+        act="$(sed -n "s/^launchable-activity: name='\([^']*\)'.*/\1/p" <<<"$badging" | head -n1)"
+    fi
+    [ -n "$pkg" ] && info "Package: ${BOLD}$pkg${NC}${CYAN}${act:+  (activity: $act)}"
+    # Remember the package so a later 'studio logcat' (no args) targets this app.
+    [ -n "$pkg" ] && { mkdir -p "$STUDIO_DIR"; echo "$pkg" > "$LAST_PKG_FILE"; }
+
+    # If no device is attached, silently try a wireless reconnect using a previously-paired
+    # port / mDNS. When it succeeds we get the real adb install/launch/logcat flow for free.
+    adb_device_ready || adb_connect >/dev/null 2>&1 || true
+
+    # 4) Install — prefer adb (true Studio-style flow, real exit codes) when a device is
+    #    attached; otherwise hand the APK to Android's package installer via termux-open.
+    if adb_device_ready; then
+        info "Installing via adb…"
+        # -r reinstall keeping data, -d allow version downgrade, -t allow test packages.
+        local out
+        out="$(adb install -r -d -t "$apk" 2>&1)" || { err "adb install failed:"; echo "$out" >&2; return 1; }
+        ok "installed via adb"
+        if [ "$launch" = "1" ] && [ -n "$pkg" ]; then
+            info "Launching $pkg…"
+            if [ -n "$act" ]; then adb shell am start -n "$pkg/$act" >/dev/null 2>&1
+            else adb shell monkey -p "$pkg" -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1; fi
+            ok "launched on device"
+        fi
+        if [ "$tail_log" = "1" ] && [ -n "$pkg" ]; then echo; studio_logcat "$pkg"; fi
+    else
+        if ! command -v termux-open >/dev/null; then
+            err "no adb device and termux-open not available; install termux-api to enable on-device install"
+            echo -e "APK is ready at: ${GREEN}$apk${NC}"
+            return 1
+        fi
+        # Snapshot the installed APK path BEFORE launching the installer; we confirm the
+        # install by watching this change, instead of trusting termux-open's return value
+        # (which reports success the instant the UI opens — even if Termux is backgrounded
+        # and the user never taps Install). This is the fix for false "install succeeded".
+        local before_path=""
+        [ -n "$pkg" ] && before_path="$(pkg_apk_path "$pkg")"
+        info "Opening the system package installer (tap Install to confirm)…"
+        termux-open --view --content-type application/vnd.android.package-archive "$apk" \
+            || { err "termux-open failed to hand the APK to the installer"; \
+                 echo -e "APK is ready at: ${GREEN}$apk${NC}"; return 1; }
+
+        if [ -z "$pkg" ]; then
+            warn "couldn't read the package name — can't verify the install automatically."
+            echo -e "APK is ready at: ${GREEN}$apk${NC}"
+            return 0
+        fi
+
+        echo
+        info "Waiting for the install to finish (safe to leave Termux in the background)…"
+        if wait_for_install "$pkg" "$before_path" 300; then
+            echo; ok "install confirmed ($pkg)"
+        else
+            echo; err "install not detected within 5 min — it was cancelled, or is still pending."
+            warn "Tip: 'studio adb pair' enables wireless adb for a one-tap, auto-verified flow."
+            return 1
+        fi
+
+        if [ "$launch" = "1" ]; then
+            # am/monkey run as the Termux UID, which can launch activities (but not install).
+            if am start -n "$pkg/$act" >/dev/null 2>&1 \
+               || monkey -p "$pkg" -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1; then
+                ok "launched $pkg"
+            else
+                warn "could not auto-launch — open ${BOLD}$pkg${NC}${YELLOW} from your app drawer."
+            fi
+        fi
+        if [ "$tail_log" = "1" ]; then
+            warn "logcat needs adb — run 'studio adb pair' once, then 'studio logcat $pkg'."
+        fi
+    fi
+}
+
+# ----------------------------------------------------------------- new
+
+studio_new() {
+    local name="" template="" dir="$PWD" package="" do_build=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --compose) template="compose" ;;
+            --xml)     template="xml" ;;
+            --dir)     dir="$2"; shift ;;
+            --package) package="$2"; shift ;;
+            --build)   do_build=1 ;;
+            -*)        err "unknown flag: $1"; return 1 ;;
+            *)         if [ -z "$name" ]; then name="$1"; else name="$name $1"; fi ;;
+        esac
+        shift
+    done
+
+    if [ -z "$name" ]; then
+        read -rp "$(echo -e "${CYAN}Project name: ${NC}")" name
+        [ -z "$name" ] && { err "name required"; return 1; }
+    fi
+    if [ -z "$template" ]; then
+        echo -e "${BOLD}Choose a template:${NC}"
+        echo "  1) Jetpack Compose  (modern, Kotlin + @Composable)"
+        echo "  2) Views / XML      (AppCompat + layout XML + ViewBinding)"
+        read -rp "$(echo -e "${CYAN}Choice (1/2): ${NC}")" t
+        case "$t" in 1) template="compose" ;; 2) template="xml" ;; *) err "invalid choice"; return 1 ;; esac
+    fi
+
+    local args=(--name "$name" --template "$template" --dir "$dir" --sdk "$SDK_DIR")
+    [ -n "$package" ] && args+=(--package "$package")
+
+    local out proj
+    out=$(python3 "$NEW_PY" "${args[@]}") || return 1
+    echo "$out" | sed '$d'                       # show generator messages
+    proj=$(echo "$out" | tail -n1)               # last line = path
+
+    echo
+    ok "Project ready: $proj"
+    if [ "$do_build" = "1" ]; then
+        studio_build "$proj" ":app:assembleDebug"
+    else
+        echo -e "Next: ${BOLD}studio build $proj${NC}"
+    fi
+}
+
+# ----------------------------------------------------------------- load
+
+studio_load() {
+    local proj
+    proj="$(resolve_project "${1:-$PWD}")" || return 1
+    info "Adapting Studio project for Termux: $proj"
+
+    # Only creates local.properties (git-ignored by every Studio project) — nothing
+    # tracked by git is modified, so the Android Studio configuration stays pristine.
+    ensure_local_props "$proj"
+    restore_daemon_jvm "$proj"   # in case a prior interrupted build left it stashed
+
+    if [ -f "$proj/$DAEMON_JVM_REL" ]; then
+        info "found $DAEMON_JVM_REL (Studio JBR pin) — kept in place; builds move it aside automatically"
+    fi
+    if ! grep -qxF "local.properties" "$proj/.gitignore" 2>/dev/null; then
+        warn "local.properties is not in .gitignore — Android Studio usually ignores it; consider adding it"
+    fi
+    check_global_gradle
+
+    # Show how this project will be adapted to the Termux toolchain (no changes made here;
+    # the actual provisioning/patching happens reversibly at build time).
+    [ -f "$COMPAT_PY" ] && python3 "$COMPAT_PY" "$proj" --check --sdk "$SDK_DIR" 2>&1 || true
+
+    echo
+    ok "Ready. Build with: ${BOLD}studio build $proj${NC}  or run it: ${BOLD}studio run $proj${NC}"
+    echo -e "   Android Studio config is untouched and stays committed to git."
+}
+
+# ----------------------------------------------------------------- clone (VCS import)
+
+studio_clone() {
+    # studio clone <repo-url> [parent-dir]   (clones, then adapts like 'load')
+    local url="${1:-}" parent="${2:-$HOME/AndroidStudioProjects}"
+    if [ -z "$url" ]; then
+        read -rp "$(echo -e "${CYAN}Repository URL: ${NC}")" url
+    fi
+    [ -z "$url" ] && { err "repository URL required"; return 1; }
+
+    # Expand a leading ~ in the destination parent.
+    parent="${parent/#\~/$HOME}"
+
+    # Derive the project folder name from the URL (strip trailing slash and .git).
+    local name; name="$(basename "${url%/}")"; name="${name%.git}"
+    [ -z "$name" ] && { err "could not derive a project name from URL"; return 1; }
+
+    mkdir -p "$parent" || { err "cannot create directory: $parent"; return 1; }
+    local dest="$parent/$name"
+    if [ -e "$dest" ] && [ -n "$(ls -A "$dest" 2>/dev/null)" ]; then
+        err "target exists and is not empty: $dest"; return 1
+    fi
+
+    info "Cloning ${BOLD}$url${NC}${CYAN} -> $dest"
+    echo
+    git clone "$url" "$dest" || { err "git clone failed"; return 1; }
+    echo
+
+    if [ -f "$dest/build.gradle" ] || [ -f "$dest/build.gradle.kts" ] || \
+       [ -f "$dest/settings.gradle" ] || [ -f "$dest/settings.gradle.kts" ]; then
+        studio_load "$dest"
+    else
+        warn "cloned, but this repo has no Gradle build files — skipping Android import"
+        ok "Cloned to: $dest"
+    fi
+    echo "$dest"   # last line = path (consumed by the TUI)
+}
+
+# ----------------------------------------------------------------- git
+
+studio_git() {
+    # studio git [path] <git args...>   (also: studio push [path])
+    local proj
+    if [ -n "${1:-}" ] && [ -d "$1" ] && [ -e "$1/.git" -o -f "$1/build.gradle" -o -f "$1/settings.gradle" ]; then
+        proj="$(cd "$1" && pwd)"; shift
+    else
+        proj="$PWD"
+    fi
+    # Guarantee the Android Studio daemon-JVM config is present before any git op.
+    restore_daemon_jvm "$proj"
+    info "Using Android Studio configuration for git (Termux overrides live in ~/.gradle, not the repo)"
+    ( cd "$proj" && git "$@" )
+}
+
+# ----------------------------------------------------------------- existing ops
+
+stop_daemons() {
+    info "Stopping Gradle/Kotlin daemons..."
+    command -v gradle >/dev/null && gradle --stop >/dev/null 2>&1 || true
+    local pids
+    pids=$(pgrep -f "org.gradle.launcher.daemon|KotlinCompileDaemon|GradleDaemon")
+    if [ -n "$pids" ]; then kill -9 $pids 2>/dev/null || true; ok "daemons stopped"; else ok "no daemons running"; fi
+}
+
+show_status() {
+    echo -e "${CYAN}===== TERMUX STUDIO STATUS =====${NC}"
+    local jprocs
+    jprocs=$(pgrep -af "GradleDaemon|KotlinCompileDaemon" | grep -v pgrep)
+    if [ -n "$jprocs" ]; then
+        echo -e "${GREEN}Active daemons:${NC}"; echo "$jprocs" | sed 's/^/  /'
+        command -v free >/dev/null && { echo -e "${BOLD}RAM:${NC}"; free -m | grep -v +; }
+    else
+        warn "no active daemons"
+    fi
+    echo -e "${BOLD}SDK:${NC} $SDK_DIR $( [ -d "$SDK_DIR" ] && echo "(ok)" || echo "(missing)")"
+    [ -d "$SDK_DIR/platforms" ] && echo -e "  platforms: $(ls "$SDK_DIR/platforms" | tr '\n' ' ')"
+}
+
+clean_cache() {
+    warn "This clears ~/.gradle/caches (deps re-download next build)."
+    read -rp "Proceed? (y/N): " c
+    [[ "$c" =~ ^[Yy]$ ]] && { rm -rf ~/.gradle/caches ~/.gradle/daemon; ok "cache cleaned"; } || info "cancelled"
+}
+
+show_env() {
+    echo -e "${CYAN}===== ENVIRONMENT =====${NC}"
+    echo -e "  ANDROID_HOME: ${GREEN}$SDK_DIR${NC}"
+    echo -e "  JAVA (gradle): ${GREEN}$(grep -h org.gradle.java.home ~/.gradle/gradle.properties 2>/dev/null | cut -d= -f2 || echo "$JAVA_HOME_DEFAULT")${NC}"
+    echo -e "  java:   ${CYAN}$(java -version 2>&1 | head -1)${NC}"
+    echo -e "  gradle: ${CYAN}$(gradle -v 2>/dev/null | grep '^Gradle ' | head -1)${NC}"
+    echo -e "  aapt2:  ${CYAN}$(grep -h aapt2FromMavenOverride ~/.gradle/gradle.properties 2>/dev/null | cut -d= -f2 || which aapt2)${NC}"
+}
+
+doctor() {
+    echo -e "${CYAN}===== STUDIO DOCTOR =====${NC}"
+    [ -d "$SDK_DIR" ] && ok "SDK at $SDK_DIR" || err "SDK missing at $SDK_DIR"
+    command -v gradle >/dev/null && ok "gradle: $(gradle -v 2>/dev/null | grep '^Gradle ' | head -1)" || err "gradle not found"
+    command -v java >/dev/null && ok "$(java -version 2>&1 | head -1)" || err "java not found"
+    local ov; ov=$(grep -h aapt2FromMavenOverride ~/.gradle/gradle.properties 2>/dev/null | cut -d= -f2)
+    if [ -n "$ov" ] && [ -x "$ov" ]; then
+        ok "aapt2 override: $ov ($("$ov" version 2>/dev/null | head -1))"
+    else
+        err "aapt2 override missing/not executable — SDK 35+ builds will fail at resource linking"
+    fi
+    grep -q org.gradle.java.home ~/.gradle/gradle.properties 2>/dev/null \
+        && ok "daemon JDK pinned in ~/.gradle" || warn "no org.gradle.java.home pin in ~/.gradle"
+    [ -f "$NEW_PY" ] && ok "project generator present" || err "missing $NEW_PY"
+    [ -f "$COMPAT_PY" ] && ok "compatibility adapter present" || warn "missing $COMPAT_PY (imported-project auto-adapt disabled)"
+    local sm="$SDK_DIR/cmdline-tools/latest/bin/sdkmanager"
+    [ -x "$sm" ] && ok "sdkmanager present (auto-installs missing SDK levels)" || warn "sdkmanager missing — can't auto-install SDK platforms"
+    if adb_device_ready; then
+        ok "adb device connected — 'studio run' uses the real install/launch/logcat flow"
+        adb devices 2>/dev/null | grep -vE '^List of|^$' | sed 's/^/    /'
+    else
+        command -v adb >/dev/null \
+            && warn "adb installed but no device — run 'studio adb pair' for wireless install + logcat" \
+            || warn "adb not installed (pkg install android-tools) — no wireless install/logcat"
+        command -v termux-open >/dev/null && ok "termux-open present (verified package-installer fallback for 'studio run')" \
+            || warn "no termux-open either — 'studio run' can't install on-device"
+    fi
+}
+
+usage() {
+    echo -e "${BOLD}Termux Studio${NC} — Android projects on Termux"
+    echo
+    echo -e "${BOLD}Project commands:${NC}"
+    echo -e "  ${GREEN}new${NC} [name] [--compose|--xml] [--dir DIR] [--package PKG] [--build]"
+    echo -e "                 Scaffold a new project (prompts if options omitted)"
+    echo -e "  ${GREEN}clone${NC} <url> [parent-dir]   Clone a repo from VCS and import it (like AS 'Get from VCS')"
+    echo -e "  ${GREEN}load${NC} [path]    Adapt a Studio-made project for Termux (keeps Studio config)"
+    echo -e "  ${GREEN}build${NC} [path] [gradle tasks...]   Build (default :app:assembleDebug)"
+    echo -e "                 Build JDK: ${CYAN}--jdk <11|17|21|/path>${NC} (else per-project pin, else default)"
+    echo -e "                 Release signing: ${CYAN}--keystore FILE --ks-pass PW --ks-alias A [--key-pass PW]${NC}"
+    echo -e "                 (release builds with no keystore are signed with the debug keystore;"
+    echo -e "                  the signed release APK is renamed to ${CYAN}<App Label>_<version>.apk${NC})"
+    echo -e "  ${GREEN}run${NC}  [path] [--release] [--no-launch] [--logcat] [signing flags]   Build, install & launch (like AS ▶)"
+    echo -e "  ${GREEN}adb${NC}  {pair|connect [port]|disconnect|status}   Wireless debugging (Android 11+, no root)"
+    echo -e "  ${GREEN}jdk${NC}  {list|install <ver>|use <ver> [project]|which}   Manage build JDKs (11/17/21)"
+    echo -e "  ${GREEN}logcat${NC} [pkg|path] [-- adb-logcat-args]   Stream the app's debug logs (needs adb)"
+    echo -e "  ${GREEN}git${NC} [path] <args> | ${GREEN}push${NC} [path]   Run git with Studio config restored"
+    echo
+    echo -e "${BOLD}Session commands:${NC}"
+    echo -e "  ${CYAN}start${NC} [path]  Interactive TUI    ${CYAN}stop${NC}  Kill daemons"
+    echo -e "  ${CYAN}status${NC}        Daemons & SDK      ${CYAN}env${NC}   Show toolchain"
+    echo -e "  ${YELLOW}clean-cache${NC}   Clear Gradle cache ${YELLOW}doctor${NC} Diagnose setup"
+    echo -e "  ${BOLD}help${NC}          This guide"
+    echo
+    echo -e "Examples:"
+    echo -e "  studio new \"My App\" --compose --dir ~/projects --build"
+    echo -e "  studio clone https://github.com/user/MyApp.git ~/AndroidStudioProjects"
+    echo -e "  studio load /storage/emulated/0/AndroidIDEProjects/FCMClient"
+    echo -e "  studio build ~/projects/MyApp :app:assembleDebug"
+    echo -e "  studio build ~/projects/MyApp assembleRelease                 # signed with debug keystore"
+    echo -e "  studio build ~/projects/MyApp assembleRelease --keystore ~/my.jks --ks-pass pw --ks-alias key"
+    echo -e "  studio run ~/projects/MyApp         # assemble + install + launch"
+    echo -e "  studio run ~/projects/MyApp --logcat   # …and stream its logs (needs wireless adb)"
+    echo -e "  studio adb pair                     # one-time Wireless debugging setup (then auto-reconnects)"
+    echo -e "  studio logcat                       # tail logs of the last app you ran"
+    echo -e "  studio push ~/projects/MyApp        # = git push, Studio config intact"
+    echo
+    echo -e "Imported projects are auto-adapted at build time (Gradle version, missing SDK"
+    echo -e "levels, AGP) — reversibly, so git and the Android Studio config stay pristine."
+}
+
+# ----------------------------------------------------------------- dispatch
+cmd="${1:-help}"; shift 2>/dev/null
+case "$cmd" in
+    new)          studio_new "$@" ;;
+    clone)        studio_clone "$@" ;;
+    load)         studio_load "$@" ;;
+    build)        studio_build "$@" ;;
+    run)          studio_run "$@" ;;
+    adb)          studio_adb "$@" ;;
+    jdk|java)     studio_jdk "$@" ;;
+    logcat|log)   studio_logcat "$@" ;;
+    git)          studio_git "$@" ;;
+    push)         studio_git "$@" push ;;
+    start)        [ -f "$STUDIO_PY" ] && python3 "$STUDIO_PY" "$@" || err "TUI not found at $STUDIO_PY" ;;
+    stop)         stop_daemons ;;
+    status)       show_status ;;
+    clean-cache)  clean_cache ;;
+    env)          show_env ;;
+    doctor)       doctor ;;
+    help|--help|-h|*) usage ;;
+esac

@@ -1,0 +1,25 @@
+# Downloadable / generated / machine-local — never committed. This repo only holds
+# the hand-built, non-downloadable pieces; install.sh fetches everything else.
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Editor / OS noise
+*.swp
+*~
+.DS_Store
+
+# Local backups install.sh may leave next to files it overwrites
+*.bak
+*.orig.bak
+*.bak.*
+
+# Downloaded toolchains / SDK / build output (must never land here)
+android-sdk/
+*.tar.xz
+*.tar.gz
+*.zip
+build-aapt2/
+build-protoc/
+android-sdk-tools-src/
