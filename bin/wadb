@@ -1,0 +1,11 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# wadb — short wrapper for studio's wireless-adb helper.
+#   wadb            → studio adb connect   (reconnect using saved/mDNS port)
+#   wadb pair       → studio adb pair
+#   wadb status     → studio adb status
+#   wadb <args...>  → studio adb <args...>
+if [ $# -eq 0 ]; then
+    exec studio adb connect
+else
+    exec studio adb "$@"
+fi

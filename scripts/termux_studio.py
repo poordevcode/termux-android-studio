@@ -14,6 +14,8 @@ import re
 
 # Where per-project signing keystore details are remembered between release builds.
 KEYSTORE_DIR = os.path.expanduser("~/.studio/keystores")
+# Per-project build/run preferences (last action, variant, logcat choice).
+BUILD_PREFS_DIR = os.path.expanduser("~/.studio/build_prefs")
 # Last project opened in the TUI — auto-reopened on the next `studio start` (no path arg).
 LAST_PROJECT_FILE = os.path.expanduser("~/.studio/last_project")
 # Fallback keytool if it isn't on PATH (matches the JDK the studio CLI pins).
@@ -76,6 +78,7 @@ class TermuxStudio:
         self.android_home = os.environ.get("ANDROID_HOME", "/data/data/com.termux/files/home/android-sdk")
         self.java_home = os.environ.get("JAVA_HOME", "")
         self.is_running = True
+        self._build_prefs = None
 
     def remember_project(self):
         """Persist the current project so the next `studio start` (with no path) reopens it."""
@@ -116,6 +119,7 @@ class TermuxStudio:
             except Exception:
                 pass
         self.remember_project()
+        self._build_prefs = None   # loaded lazily
 
     def clear_screen(self):
         os.system('clear')
@@ -406,6 +410,70 @@ class TermuxStudio:
         self.run_gradle_task(custom_input)
         input("\nPress Enter to continue...")
 
+    # ---------------------------------------------------------- build prefs (remember choices)
+
+    def _build_prefs_file(self):
+        """Per-project file where the last build/run choices are stored."""
+        os.makedirs(BUILD_PREFS_DIR, exist_ok=True)
+        key = self.project_path.replace("/", "_").replace(" ", "_")
+        return os.path.join(BUILD_PREFS_DIR, key + ".json")
+
+    def load_build_prefs(self):
+        """Return the remembered build prefs dict for this project, or {}."""
+        if self._build_prefs is not None:
+            return self._build_prefs
+        f = self._build_prefs_file()
+        if os.path.isfile(f):
+            try:
+                with open(f) as fh:
+                    self._build_prefs = json.load(fh)
+                    return self._build_prefs
+            except Exception:
+                pass
+        self._build_prefs = {}
+        return self._build_prefs
+
+    def save_build_prefs(self, **kw):
+        """Merge key/value pairs into the persisted build prefs for this project."""
+        prefs = self.load_build_prefs()
+        prefs.update(kw)
+        self._build_prefs = prefs
+        f = self._build_prefs_file()
+        try:
+            with open(f, "w") as fh:
+                json.dump(prefs, fh)
+        except Exception:
+            pass
+
+    def reset_build_prefs(self):
+        """Forget the remembered build/run settings (variant, logcat, last action) for this project."""
+        self.print_header()
+        if not self.project_path:
+            print(f"{Colors.RED}Please load a project first!{Colors.END}")
+            time.sleep(1.5)
+            return
+        f = self._build_prefs_file()
+        if os.path.isfile(f):
+            try:
+                os.remove(f)
+                self._build_prefs = None
+                print(f"{Colors.GREEN}Remembered build/run settings cleared for this project.{Colors.END}")
+                print(f"{Colors.CYAN}Next build/run will ask for variant and logcat again.{Colors.END}")
+            except Exception as e:
+                print(f"{Colors.RED}Could not clear: {e}{Colors.END}")
+        else:
+            print(f"{Colors.YELLOW}No remembered build/run settings for this project.{Colors.END}")
+        input("\nPress Enter to continue...")
+
+    _BUILD_LABELS = {
+        "1": "Assemble Debug APK",
+        "2": "Assemble Release APK",
+        "3": "Clean Project",
+        "4": "Clean + Assemble Debug",
+        "5": "Run on Device ▶",
+        "6": "Run via Shizuku ⚡ (connect + install)",
+    }
+
     def build_project(self):
         self.print_header()
         if not self.project_path:
@@ -413,40 +481,62 @@ class TermuxStudio:
             time.sleep(1.5)
             return
 
+        prefs = self.load_build_prefs()
+        last = prefs.get("build_action", "")
+        last_label = self._BUILD_LABELS.get(last, "")
+
         print(f"{Colors.BOLD}Select Build Action:{Colors.END}")
-        print("1. Assemble Debug APK (assembleDebug)")
-        print("2. Assemble Release APK (assembleRelease)")
-        print("3. Clean Project (clean)")
-        print("4. Clean and Assemble Debug")
-        print(f"5. {Colors.GREEN}Run on Device ▶{Colors.END} (build + install + launch, like Android Studio)")
-        print("6. Reset remembered release settings (keystore / name / skip-prompts)")
-        print("7. Back to Main Menu")
+        for num, label in sorted(self._BUILD_LABELS.items()):
+            mark = f" {Colors.GREEN}(last){Colors.END}" if num == last else ""
+            prefix = f"{Colors.GREEN}" if num in ("5", "6") else ""
+            suffix = f"{Colors.END}" if num in ("5", "6") else ""
+            print(f"  {num}. {prefix}{label}{suffix}{mark}")
+        print("  7. Reset remembered release settings (keystore / name / skip-prompts)")
+        print("  8. Reset remembered build/run settings (variant / logcat / last action)")
+        print("  9. Back to Main Menu")
+        if last_label:
+            print(f"\n  {Colors.CYAN}Press Enter to repeat: {last_label}{Colors.END}")
         print()
 
-        choice = input(f"{Colors.CYAN}Choice (1-7): {Colors.END}").strip()
+        choice = input(f"{Colors.CYAN}Choice (1-9): {Colors.END}").strip()
+        # Enter with no input → repeat last action
+        if not choice and last:
+            choice = last
 
         if choice == "5":
+            self.save_build_prefs(build_action="5")
             self.run_on_device()
             return
         if choice == "6":
+            self.save_build_prefs(build_action="6")
+            self.run_on_device(shizuku=True)
+            return
+        if choice == "7":
             self.reset_release_memory()
             return
+        if choice == "8":
+            self.reset_build_prefs()
+            return
         if choice == "1":
+            self.save_build_prefs(build_action="1")
             success = self.run_gradle_task("assembleDebug")
             if success:
                 self.locate_and_offer_apks()
             else:
                 input("\nPress Enter to continue...")
         elif choice == "2":
+            self.save_build_prefs(build_action="2")
             success = self.assemble_release()
             if success:
                 self.locate_and_offer_apks()
             else:
                 input("\nPress Enter to continue...")
         elif choice == "3":
+            self.save_build_prefs(build_action="3")
             self.run_gradle_task("clean")
             input("\nPress Enter to continue...")
         elif choice == "4":
+            self.save_build_prefs(build_action="4")
             if self.run_gradle_task("clean"):
                 success = self.run_gradle_task("assembleDebug")
                 if success:
@@ -719,31 +809,84 @@ class TermuxStudio:
 
         return self.run_gradle_task(self._release_task(ks, custom_name))
 
-    def run_on_device(self):
+    def run_on_device(self, shizuku=False):
         """Build, install and launch the app — delegates to `studio run`, which auto-adapts
         the project to the Termux toolchain and installs via adb or the package installer.
         Install success is verified against the real package state (works even if Termux is
-        backgrounded), and logs can be streamed afterwards over wireless adb."""
+        backgrounded), and logs can be streamed afterwards over wireless adb.
+
+        When ``shizuku`` is True the APK is installed through Shizuku/rish (shell-uid
+        `pm install`) — no wireless-adb pairing and no package-installer tap required.
+
+        Remembers variant (debug/release) and logcat choice per-project.  When 'skip prompts'
+        is enabled, option 5/6 runs directly without any questions."""
         if not self.project_path:
             print(f"{Colors.RED}Please load a project first!{Colors.END}")
             time.sleep(1.5)
             return
+
+        if shizuku:
+            print(f"{Colors.BOLD}Transport: {Colors.GREEN}Shizuku (rish){Colors.END} — "
+                  f"installs with shell privileges, no adb pairing.\n")
+
+        prefs = self.load_build_prefs()
+
+        # ── Fast path: skip prompts when remembered ──
+        if prefs.get("run_auto"):
+            variant = prefs.get("run_variant", "debug")
+            want_log = prefs.get("run_logcat", False)
+            log_str = "yes" if want_log else "no"
+            print(f"{Colors.GREEN}Using remembered run settings (skip-prompts is ON):{Colors.END}")
+            print(f"  variant: {variant}")
+            print(f"  logcat:  {log_str}")
+            print(f"{Colors.CYAN}  (reset via Build menu → option 8){Colors.END}\n")
+            self._exec_run(variant, want_log, shizuku=shizuku)
+            return
+
+        # ── Interactive flow ──
+        last_variant = prefs.get("run_variant", "debug")
+        last_logcat = prefs.get("run_logcat", False)
+        last_v_num = "2" if last_variant == "release" else "1"
+
         print(f"{Colors.BOLD}Variant:{Colors.END}")
-        print(f"  1. {Colors.GREEN}Debug{Colors.END} (default)")
-        print("  2. Release")
+        d_mark = f" {Colors.GREEN}(last){Colors.END}" if last_variant == "debug" else ""
+        r_mark = f" {Colors.GREEN}(last){Colors.END}" if last_variant == "release" else ""
+        print(f"  1. {Colors.GREEN}Debug{Colors.END}{d_mark}")
+        print(f"  2. Release{r_mark}")
         print("  0. Cancel")
-        v = input(f"{Colors.CYAN}Choice [1]: {Colors.END}").strip() or "1"
+        v = input(f"{Colors.CYAN}Choice [{last_v_num}]: {Colors.END}").strip() or last_v_num
         if v == "0":
             return
         if v not in ("1", "2"):
             print(f"{Colors.RED}Invalid choice.{Colors.END}"); time.sleep(1.2); return
         variant = "release" if v == "2" else "debug"
-        want_log = input(f"{Colors.CYAN}Stream logcat after launch? (y/N): {Colors.END}").strip().lower() == "y"
+
+        log_hint = "Y/n" if last_logcat else "y/N"
+        log_input = input(f"{Colors.CYAN}Stream logcat after launch? ({log_hint}): {Colors.END}").strip().lower()
+        if not log_input:
+            want_log = last_logcat
+        else:
+            want_log = log_input == "y"
+
+        # Ask whether to remember & skip prompts next time
+        print(f"\n{Colors.BOLD}Remember these run settings?{Colors.END}")
+        print("  1. No (ask every time)")
+        print(f"  2. {Colors.GREEN}Remember & skip prompts{Colors.END} — run directly next time")
+        rc = input(f"{Colors.CYAN}Choice [1]: {Colors.END}").strip() or "1"
+        run_auto = (rc == "2")
+
+        self.save_build_prefs(run_variant=variant, run_logcat=want_log, run_auto=run_auto)
+        self._exec_run(variant, want_log, shizuku=shizuku)
+
+    def _exec_run(self, variant, want_log, shizuku=False):
+        """Execute the studio run command."""
         cmd = ["studio", "run", self.project_path]
         if variant == "release":
             cmd.append("--release")
         if want_log:
             cmd.append("--logcat")
+        if shizuku:
+            cmd.append("--shizuku")
         print(f"\n{Colors.YELLOW}Running: {' '.join(cmd)}{Colors.END}\n")
         self.status = "Building, installing & launching..."
         try:

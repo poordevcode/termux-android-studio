@@ -300,7 +300,7 @@ studio_build() {
     fi
     # Separate keystore/signing flags from the Gradle tasks. Everything that isn't a
     # signing flag is forwarded verbatim to Gradle.
-    local ks_file="" ks_pass="" ks_alias="" key_pass="" jdk_override="" apk_name=""
+    local ks_file="" ks_pass="" ks_alias="" key_pass="" jdk_override="" apk_name="" want_lint=0
     while [ $# -gt 0 ]; do
         case "$1" in
             --keystore|--ks)        ks_file="$2"; shift 2 ;;
@@ -309,6 +309,8 @@ studio_build() {
             --key-pass)             key_pass="$2"; shift 2 ;;
             --jdk|--java)           jdk_override="$2"; shift 2 ;;
             --apk-name|--release-name) apk_name="$2"; shift 2 ;;
+            --lint)                 want_lint=1; shift ;;
+            --no-lint)              want_lint=0; shift ;;
             *)                      tasks+=("$1"); shift ;;
         esac
     done
@@ -336,6 +338,18 @@ studio_build() {
             "-Pandroid.injected.signing.key.alias=$ks_alias"
             "-Pandroid.injected.signing.key.password=$key_pass"
         )
+    fi
+
+    # Speed: lintVitalRelease runs on every assembleRelease and is the slowest single
+    # task (can add minutes on-device). Skip it by default for fast dev iteration; the
+    # user can force the release lint scan back on with `--lint`. Only excluded when a
+    # release task is requested and the user didn't explicitly ask for a lint task.
+    local perf_args=()
+    if printf '%s\n' "${tasks[@]}" | grep -qi 'release' \
+       && [ "$want_lint" -eq 0 ] \
+       && ! printf '%s\n' "${tasks[@]}" | grep -qi 'lint'; then
+        perf_args+=("-x" "lintVitalRelease")
+        info "skipping lintVitalRelease for speed (use --lint to keep the release lint scan)"
     fi
 
     check_global_gradle
@@ -392,7 +406,7 @@ studio_build() {
     echo
     ( cd "$proj" && \
       env "${jdk_env[@]}" ANDROID_HOME="$SDK_DIR" ANDROID_SDK_ROOT="$SDK_DIR" \
-      "$gradle_bin" "${tasks[@]}" "${sign_props[@]}" "${jdk_props[@]}" --no-daemon --console=plain )
+      "$gradle_bin" "${tasks[@]}" "${sign_props[@]}" "${jdk_props[@]}" "${perf_args[@]}" --no-daemon --console=plain )
     local rc=$?
 
     _restore; trap - EXIT INT TERM
@@ -546,6 +560,23 @@ studio_adb() {
 # a backgrounded/minimized Termux report the truth instead of a premature "success".
 pkg_apk_path() { pm path "$1" 2>/dev/null | sed -n 's/^package://p' | head -n1; }
 
+# The system package installer runs as a different uid and cannot read Termux-private
+# storage (/data/data/com.termux/...). If the APK lives there, copy it to shared storage
+# so the installer can parse it; APKs already on /storage|/sdcard are handed over in place.
+# Prints a path the installer can read.
+ensure_installable_apk() {   # $1 apk
+    local apk="$1"
+    case "$apk" in
+        /data/data/com.termux/*)
+            local dest_dir="/storage/emulated/0/Download/studio-install"
+            mkdir -p "$dest_dir" 2>/dev/null || { echo "$apk"; return 0; }
+            local dest="$dest_dir/$(basename "$apk")"
+            cp -f "$apk" "$dest" 2>/dev/null && { echo "$dest"; return 0; }
+            echo "$apk" ;;
+        *) echo "$apk" ;;
+    esac
+}
+
 wait_for_install() {   # $1 pkg, $2 path-before, $3 timeout-seconds (default 300)
     local pkg="$1" prev="$2" timeout="${3:-300}" i=0 cur
     while [ "$i" -lt "$timeout" ]; do
@@ -554,6 +585,197 @@ wait_for_install() {   # $1 pkg, $2 path-before, $3 timeout-seconds (default 300
         sleep 2; i=$((i+2)); printf '.' >&2
     done
     return 1
+}
+
+# ----------------------------------------------------------------- Shizuku (shizuku CLI)
+#
+# Shizuku lets a non-root Termux run `pm install` with shell (uid 2000) privileges — no
+# wireless-adb pairing and no package-installer UI tap. We delegate the actual bridge to the
+# external `termux-shizuku-tools` package (the `shizuku`/`shk` CLI, AlexeiCrystal/…) instead
+# of carrying our own rish copy, so the rish_shizuku.dex stays in lockstep with that package.
+#   install:  pkg install termux-shizuku-tools   (or build its .deb — see the repo)
+# then in the Shizuku app: "Use Shizuku in terminal apps" once, and start the service per boot.
+#
+# Two device-specific gotchas this wrapper papers over (both seen on HyperOS/MIUI):
+#   • the dex MUST match the *installed* Shizuku app — a mismatched dex throws
+#     UnsatisfiedLinkError (librish.so) or just times out; shizuku_sync_dex repairs it from
+#     the live APK over adb when available.
+#   • MIUI Doze freezes the Shizuku/Termux processes → intermittent "Request timeout";
+#     shizuku_unfreeze whitelists both via adb so the binder handshake stops flaking.
+
+# Locate the external shizuku CLI (from termux-shizuku-tools).
+shizuku_cli() { command -v shizuku 2>/dev/null; }
+
+# Best-effort: keep Shizuku + Termux out of Doze so the rish binder handshake doesn't time
+# out. Needs an adb shell (uid 2000); silently no-ops without one. Every adb call is wrapped
+# in `timeout` so a wedged adb after a heavy build can never hang the run. User whitelist
+# entries persist across reboots, so this is cheap to re-assert.
+shizuku_unfreeze() {
+    adb_device_ready || return 0
+    timeout 10 adb shell dumpsys deviceidle whitelist +com.termux                 >/dev/null 2>&1
+    timeout 10 adb shell dumpsys deviceidle whitelist +moe.shizuku.privileged.api >/dev/null 2>&1
+}
+
+# Best-effort, LAZY repair only: make sure the package's rish_shizuku.dex matches the
+# *installed* Shizuku app. The canonical dex ships inside the Shizuku APK
+# (assets/rish_shizuku.dex); pull it over adb and overwrite the package copy if they differ.
+# This is NOT on the hot path — it only runs after a probe fails or via `studio shizuku sync`,
+# because pulling the whole APK is slow. No adb / not installed → silent no-op. All adb calls
+# are time-boxed so this can never hang.
+shizuku_sync_dex() {
+    local dex="$PREFIX/libexec/shizuku/rish_shizuku.dex"
+    [ -f "$dex" ] || return 0
+    adb_device_ready || return 0
+    command -v unzip >/dev/null 2>&1 || return 0
+    local apk; apk="$(timeout 10 adb shell pm path moe.shizuku.privileged.api 2>/dev/null \
+                       | sed 's/package://' | tr -d '\r' | head -n1)"
+    [ -n "$apk" ] || return 0
+    local tmp; tmp="$(mktemp -d)" || return 0
+    timeout 40 adb pull "$apk" "$tmp/base.apk" >/dev/null 2>&1 || { rm -rf "$tmp"; return 0; }
+    unzip -o -j "$tmp/base.apk" assets/rish_shizuku.dex -d "$tmp" >/dev/null 2>&1 || { rm -rf "$tmp"; return 0; }
+    if [ -f "$tmp/rish_shizuku.dex" ] && ! cmp -s "$tmp/rish_shizuku.dex" "$dex"; then
+        chmod 600 "$dex" 2>/dev/null; rm -f "$dex"
+        cp "$tmp/rish_shizuku.dex" "$dex" && chmod 400 "$dex"
+        info "synced rish_shizuku.dex to the installed Shizuku app"
+    fi
+    rm -rf "$tmp"
+}
+
+# Run a command through the shizuku CLI, returning its stdout + the remote exit code, always
+# time-boxed. $1 = command string, $2 = timeout seconds (default 20). Retries/thawing are the
+# caller's job (see shizuku_probe) so a simple per-call helper never compounds delays.
+shizuku_exec() {
+    local cmd="$1" t="${2:-20}" s; s="$(shizuku_cli)" || return 127
+    timeout "$t" "$s" exec "$cmd" 2>&1
+}
+
+# Probe Shizuku, echoing the uid it runs as (2000 = shell, 0 = root). Cached per-process.
+# A normal call answers in ~1s; right after a heavy build the app can be cold or briefly frozen
+# by MIUI, so keep Termux/Shizuku out of Doze (adb, non-disruptive) and retry a few quick times.
+# We deliberately do NOT foreground the Shizuku GUI here — that would yank the user off-screen
+# without helping the install. Bounded worst case (~3×20s) so it fails fast, never hangs.
+SHIZUKU_UID_CACHE=""
+shizuku_probe() {
+    [ -n "$SHIZUKU_UID_CACHE" ] && { echo "$SHIZUKU_UID_CACHE"; return 0; }
+    local s; s="$(shizuku_cli)" || return 1
+    shizuku_unfreeze
+    # The FIRST rish call right after a heavy build boots a cold JVM under load and can take a
+    # while, so give attempt 1 a generous window; later tries are quick. Print a dot per attempt
+    # so the run never looks frozen. A dex mismatch (the only thing the slow APK-pull repair
+    # fixes) shows up as UnsatisfiedLinkError/librish — repair ONLY then, never on a plain
+    # timeout. Bounded worst case (~45+25+25s) and it always prints progress.
+    local u out i t
+    for i in 1 2 3; do
+        t=$([ "$i" = 1 ] && echo 45 || echo 25)
+        printf '.' >&2
+        out="$(timeout "$t" "$s" exec 'id -u' 2>&1 | tr -d '\r')"
+        u="$(printf '%s' "$out" | tail -n1)"
+        case "$u" in [0-9]*) printf '\n' >&2; SHIZUKU_UID_CACHE="$u"; echo "$u"; return 0 ;; esac
+        if echo "$out" | grep -qiE "UnsatisfiedLinkError|librish"; then
+            printf ' (dex mismatch — repairing)' >&2; shizuku_sync_dex; continue
+        fi
+        [ "$i" -lt 3 ] && sleep 2
+    done
+    printf '\n' >&2
+    return 1
+}
+
+# True if Shizuku is reachable (service running and binder bound).
+shizuku_ready() { shizuku_probe >/dev/null 2>&1; }
+
+shizuku_status() {
+    local s
+    if ! s="$(shizuku_cli)"; then
+        err "shizuku CLI not found — install the termux-shizuku-tools package:"
+        echo -e "     ${BOLD}pkg install termux-shizuku-tools${NC}  (or build its .deb, see"
+        echo -e "     ${CYAN}https://github.com/AlexeiCrystal/termux-shizuku-tools${NC}), then in the"
+        echo -e "     Shizuku app tap ${BOLD}'Use Shizuku in terminal apps'${NC} once."
+        return 1
+    fi
+    printf '%b' "${CYAN}ℹ connecting to Shizuku${NC} (first call after a build can take ~30s)"
+    local u; u="$(shizuku_probe)"
+    if [ -n "$u" ]; then
+        case "$u" in
+            0)    ok "Shizuku connected (running as root)" ;;
+            2000) ok "Shizuku connected (running as shell, uid 2000)" ;;
+            *)    ok "Shizuku connected (uid $u)" ;;
+        esac
+        return 0
+    fi
+    err "Shizuku not reachable — open the Shizuku app and make sure the service is started"
+    echo -e "     (start it once per boot via wireless-adb or root), then grant terminal access."
+    echo -e "     If it keeps timing out, disable battery optimisation for Shizuku + Termux."
+    return 1
+}
+
+# Install an APK through Shizuku. $1 = apk, $2 = package name (optional; derived via aapt2 if
+# omitted — used to *verify* the install). The shell user can read shared storage but not
+# Termux-private files, so reuse ensure_installable_apk to stage it where the bridge can see it.
+#
+# CRUCIAL: rish prints "Request timeout … blocked by your system" to stdout but STILL EXITS 0,
+# so a naive `rc==0 && no Failure/Error` check reports a false-positive success on a timeout.
+# We therefore (a) retry transient timeouts, and (b) require POSITIVE proof — pm printing
+# "Success", or the package actually resolving via `pm path` *through Shizuku* (works with no
+# adb). Never report success off the exit code alone.
+shizuku_install() {   # $1 apk, $2 pkg
+    local apk="$1" pkg="${2:-}" s; s="$(shizuku_cli)" || { err "shizuku CLI not found"; return 1; }
+    if [ -z "$pkg" ]; then
+        local a2; a2="$(aapt2_bin)"
+        [ -n "$a2" ] && pkg="$("$a2" dump badging "$apk" 2>/dev/null \
+            | sed -n "s/^package: name='\([^']*\)'.*/\1/p" | head -n1)"
+    fi
+    # Stage onto shared storage so the Shizuku shell (uid 2000) can read it (it can't see
+    # Termux-private files). Then the install itself must NOT be `pm install <storage-path>` —
+    # on Android 13+ the installer can't pull an fd from FUSE /storage and returns 255 with no
+    # output. The reliable route (what `adb install` does) is: have the Shizuku shell copy the
+    # APK into /data/local/tmp (which uid 2000 owns) and install from there.
+    local staged; staged="$(ensure_installable_apk "$apk")"
+    local rtmp="/data/local/tmp/studio-install-$$.apk"
+    local remote="cp '$staged' '$rtmp' && pm install -r -d -t '$rtmp'; __r=\$?; rm -f '$rtmp'; exit \$__r"
+    info "Installing via Shizuku (pm install)…"
+    local out rc i
+    for i in 1 2 3; do
+        out="$(timeout 120 "$s" exec "$remote" 2>&1 | tr -d '\r')"; rc=$?
+        if echo "$out" | grep -qiE "Request timeout|may be blocked"; then
+            warn "Shizuku connection timed out (attempt $i/3) — retrying…"
+            sleep 2; continue
+        fi
+        break
+    done
+    # Positive verification — pm said Success, OR the package now resolves through Shizuku.
+    if echo "$out" | grep -qi "Success" \
+       || { [ -n "$pkg" ] && timeout 25 "$s" exec "pm path $pkg" 2>/dev/null | grep -qi "^package:"; }; then
+        ok "installed via Shizuku${pkg:+ ($pkg)}"
+        return 0
+    fi
+    err "Shizuku install failed (exit $rc):"; echo "${out:-<no output from pm>}" >&2
+    [ -n "$pkg" ] || warn "could not derive package name to verify — pass it as 2nd arg."
+    echo -e "     If this is a timeout, Shizuku was briefly blocked; re-run, or use MT Manager once" >&2
+    echo -e "     to confirm Shizuku is granted, then retry." >&2
+    return 1
+}
+
+# Launch an installed package through Shizuku (shell uid can always start the launcher).
+shizuku_launch() {   # $1 pkg, $2 activity (may be empty)
+    local pkg="$1" act="$2"; shizuku_cli >/dev/null || return 1
+    { [ -n "$act" ] && shizuku_exec "am start -n '$pkg/$act'" >/dev/null 2>&1; } \
+        || shizuku_exec "monkey -p '$pkg' -c android.intent.category.LAUNCHER 1" >/dev/null 2>&1
+}
+
+studio_shizuku() {
+    local sub="${1:-status}"; shift 2>/dev/null
+    case "$sub" in
+        status|state|s|connect|c|info|i) shizuku_status ;;
+        open|o)    local s; s="$(shizuku_cli)" || { err "shizuku CLI not found"; return 1; }; "$s" open ;;
+        sync)      shizuku_sync_dex && ok "dex in sync with the installed Shizuku app" ;;
+        install|inst)
+            local apk="${1:-}"
+            [ -z "$apk" ] && { err "usage: studio shizuku install <apk>"; return 1; }
+            [ -f "$apk" ] || { err "no such APK: $apk"; return 1; }
+            shizuku_status || return 1
+            shizuku_install "$apk" ;;
+        *) err "usage: studio shizuku {status|open|sync|install <apk>}"; return 1 ;;
+    esac
 }
 
 # ----------------------------------------------------------------- logcat (debug logs)
@@ -573,8 +795,8 @@ studio_logcat() {
     if [ -n "$arg" ] && [ -d "$arg" ]; then
         # A project path → read the package from its freshest APK via aapt2.
         local a2 apk; a2="$(aapt2_bin)"
-        apk="$(find "$arg" -path '*/build/outputs/apk/*.apk' -type f ! -name '*-unsigned.apk' 2>/dev/null \
-               | xargs -r ls -t 2>/dev/null | head -n1)"
+        apk="$(find "$arg" -path '*/build/outputs/apk/*.apk' -type f ! -name '*-unsigned.apk' -print0 2>/dev/null \
+               | xargs -0 -r ls -t 2>/dev/null | head -n1)"
         [ -n "$a2" ] && [ -n "$apk" ] && pkg="$("$a2" dump badging "$apk" 2>/dev/null \
                | sed -n "s/^package: name='\([^']*\)'.*/\1/p" | head -n1)"
     elif [ -n "$arg" ]; then
@@ -596,8 +818,8 @@ studio_logcat() {
 }
 
 studio_run() {
-    # studio run [path] [--release] [--no-launch] [--logcat] [extra gradle tasks...]
-    local proj="" variant="debug" launch=1 tail_log=0 extra=()
+    # studio run [path] [--release] [--no-launch] [--logcat] [--shizuku] [extra gradle tasks...]
+    local proj="" variant="debug" launch=1 tail_log=0 use_shizuku=0 extra=()
     local first="${1:-}"
     if [ -n "$first" ] && [ -d "$first" ]; then proj="$first"; shift; fi
     while [ $# -gt 0 ]; do
@@ -606,6 +828,7 @@ studio_run() {
             --debug)     variant="debug" ;;
             --no-launch) launch=0 ;;
             --logcat|--log) tail_log=1 ;;
+            --shizuku|--rish) use_shizuku=1 ;;
             *)           extra+=("$1") ;;
         esac
         shift
@@ -621,8 +844,8 @@ studio_run() {
     #    which is the usual cause of "App not installed" on a release run.
     local apk
     apk="$(find "$proj" -path "*/build/outputs/apk/${variant}/*.apk" -type f \
-            ! -name '*-unsigned.apk' 2>/dev/null \
-            | xargs -r ls -t 2>/dev/null | head -n1)"
+            ! -name '*-unsigned.apk' -print0 2>/dev/null \
+            | xargs -0 -r ls -t 2>/dev/null | head -n1)"
     if [ -z "$apk" ]; then
         # Nothing signed found — surface a clear reason rather than silently failing later.
         local unsigned
@@ -654,8 +877,21 @@ studio_run() {
     # port / mDNS. When it succeeds we get the real adb install/launch/logcat flow for free.
     adb_device_ready || adb_connect >/dev/null 2>&1 || true
 
-    # 4) Install — prefer adb (true Studio-style flow, real exit codes) when a device is
-    #    attached; otherwise hand the APK to Android's package installer via termux-open.
+    # 4) Install — Shizuku (rish) when asked; else prefer adb (true Studio-style flow, real
+    #    exit codes) when a device is attached; otherwise hand the APK to the package installer.
+    if [ "$use_shizuku" = "1" ]; then
+        shizuku_status || return 1
+        shizuku_install "$apk" "$pkg" || return 1
+        if [ "$launch" = "1" ] && [ -n "$pkg" ]; then
+            info "Launching $pkg…"
+            if shizuku_launch "$pkg" "$act"; then ok "launched $pkg"
+            else warn "could not auto-launch — open ${BOLD}$pkg${NC}${YELLOW} from your app drawer."; fi
+        fi
+        if [ "$tail_log" = "1" ] && [ -n "$pkg" ]; then
+            warn "logcat needs adb — run 'studio adb pair' once, then 'studio logcat $pkg'."
+        fi
+        return 0
+    fi
     if adb_device_ready; then
         info "Installing via adb…"
         # -r reinstall keeping data, -d allow version downgrade, -t allow test packages.
@@ -670,21 +906,33 @@ studio_run() {
         fi
         if [ "$tail_log" = "1" ] && [ -n "$pkg" ]; then echo; studio_logcat "$pkg"; fi
     else
-        if ! command -v termux-open >/dev/null; then
-            err "no adb device and termux-open not available; install termux-api to enable on-device install"
-            echo -e "APK is ready at: ${GREEN}$apk${NC}"
-            return 1
-        fi
         # Snapshot the installed APK path BEFORE launching the installer; we confirm the
-        # install by watching this change, instead of trusting termux-open's return value
-        # (which reports success the instant the UI opens — even if Termux is backgrounded
-        # and the user never taps Install). This is the fix for false "install succeeded".
+        # install by watching this change instead of trusting the launch return value
+        # (which succeeds the instant the UI opens — even if Termux is backgrounded and
+        # the user never taps Install). This is the fix for false "install succeeded".
         local before_path=""
         [ -n "$pkg" ] && before_path="$(pkg_apk_path "$pkg")"
+        local install_apk; install_apk="$(ensure_installable_apk "$apk")"
         info "Opening the system package installer (tap Install to confirm)…"
-        termux-open --view --content-type application/vnd.android.package-archive "$apk" \
-            || { err "termux-open failed to hand the APK to the installer"; \
-                 echo -e "APK is ready at: ${GREEN}$apk${NC}"; return 1; }
+        # Build the VIEW + package-archive intent directly with `am`. We deliberately avoid
+        # termux-open here: it re-issues the APK as a content://com.termux.files FileProvider
+        # URI, which HyperOS's package installer can't read → "problem parsing the package".
+        # A plain file:// URI on shared storage is readable by the installer.
+        if ! am start -a android.intent.action.VIEW \
+                -d "file://$install_apk" \
+                -t application/vnd.android.package-archive \
+                --grant-read-uri-permission >/dev/null 2>&1; then
+            # Fallback: hand it to termux-open if the direct intent is rejected.
+            if command -v termux-open >/dev/null; then
+                termux-open --view --content-type application/vnd.android.package-archive "$install_apk" \
+                    || { err "couldn't hand the APK to the system installer"; \
+                         echo -e "APK is ready at: ${GREEN}$apk${NC}"; return 1; }
+            else
+                err "couldn't launch the system installer"
+                echo -e "APK is ready at: ${GREEN}$apk${NC}"
+                return 1
+            fi
+        fi
 
         if [ -z "$pkg" ]; then
             warn "couldn't read the package name — can't verify the install automatically."
@@ -918,8 +1166,8 @@ doctor() {
         command -v adb >/dev/null \
             && warn "adb installed but no device — run 'studio adb pair' for wireless install + logcat" \
             || warn "adb not installed (pkg install android-tools) — no wireless install/logcat"
-        command -v termux-open >/dev/null && ok "termux-open present (verified package-installer fallback for 'studio run')" \
-            || warn "no termux-open either — 'studio run' can't install on-device"
+        ok "'studio run' will install via the system package installer (direct VIEW intent; verified path-watch confirm)"
+        command -v termux-open >/dev/null || info "termux-open not installed — fine; only used as a fallback now"
     fi
 }
 
@@ -932,12 +1180,15 @@ usage() {
     echo -e "  ${GREEN}clone${NC} <url> [parent-dir]   Clone a repo from VCS and import it (like AS 'Get from VCS')"
     echo -e "  ${GREEN}load${NC} [path]    Adapt a Studio-made project for Termux (keeps Studio config)"
     echo -e "  ${GREEN}build${NC} [path] [gradle tasks...]   Build (default :app:assembleDebug)"
+    echo -e "  ${GREEN}gradle${NC} [path] <tasks/args...>   Run any Gradle task with the Termux toolchain (test/lint/…)"
     echo -e "                 Build JDK: ${CYAN}--jdk <11|17|21|/path>${NC} (else per-project pin, else default)"
     echo -e "                 Release signing: ${CYAN}--keystore FILE --ks-pass PW --ks-alias A [--key-pass PW]${NC}"
     echo -e "                 Release APK name: ${CYAN}--apk-name NAME${NC} (default ${CYAN}<App Label>_<version>.apk${NC})"
+    echo -e "                 Release lint: skipped for speed by default; ${CYAN}--lint${NC} keeps the lintVitalRelease scan"
     echo -e "                 (release builds with no keystore are signed with the debug keystore)"
-    echo -e "  ${GREEN}run${NC}  [path] [--release] [--no-launch] [--logcat] [signing flags]   Build, install & launch (like AS ▶)"
+    echo -e "  ${GREEN}run${NC}  [path] [--release] [--no-launch] [--logcat] [--shizuku] [signing flags]   Build, install & launch (like AS ▶)"
     echo -e "  ${GREEN}adb${NC}  {pair|connect [port]|disconnect|status}   Wireless debugging (Android 11+, no root)"
+    echo -e "  ${GREEN}shizuku${NC} {status|open|sync|install <apk>}   Install via Shizuku (no adb pairing, no root)"
     echo -e "  ${GREEN}jdk${NC}  {list|install <ver>|use <ver> [project]|which}   Manage build JDKs (11/17/21)"
     echo -e "  ${GREEN}logcat${NC} [pkg|path] [-- adb-logcat-args]   Stream the app's debug logs (needs adb)"
     echo -e "  ${GREEN}git${NC} [path] <args> | ${GREEN}push${NC} [path]   Run git with Studio config restored"
@@ -957,6 +1208,10 @@ usage() {
     echo -e "  studio build ~/projects/MyApp assembleRelease --keystore ~/my.jks --ks-pass pw --ks-alias key"
     echo -e "  studio run ~/projects/MyApp         # assemble + install + launch"
     echo -e "  studio run ~/projects/MyApp --logcat   # …and stream its logs (needs wireless adb)"
+    echo -e "  studio run ~/projects/MyApp --shizuku  # install via Shizuku (no adb pairing, no root)"
+    echo -e "  studio run ~/projects/MyApp --shizuku --no-launch   # headless build+install for agents/CI"
+    echo -e "  studio gradle ~/projects/MyApp testDebugUnitTest    # run unit tests (Termux toolchain)"
+    echo -e "  studio gradle ~/projects/MyApp :app:lintDebug       # lint a module"
     echo -e "  studio adb pair                     # one-time Wireless debugging setup (then auto-reconnects)"
     echo -e "  studio logcat                       # tail logs of the last app you ran"
     echo -e "  studio push ~/projects/MyApp        # = git push, Studio config intact"
@@ -972,8 +1227,10 @@ case "$cmd" in
     clone)        studio_clone "$@" ;;
     load)         studio_load "$@" ;;
     build)        studio_build "$@" ;;
+    gradle|gw|task) studio_build "$@" ;;
     run)          studio_run "$@" ;;
     adb)          studio_adb "$@" ;;
+    shizuku|rish) studio_shizuku "$@" ;;
     jdk|java)     studio_jdk "$@" ;;
     logcat|log)   studio_logcat "$@" ;;
     git)          studio_git "$@" ;;

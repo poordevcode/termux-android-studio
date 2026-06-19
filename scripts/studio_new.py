@@ -549,7 +549,11 @@ def main():
     theme_prefix = pascal_case(name)
     theme_name = f"Theme.{theme_prefix}"
 
-    root = os.path.abspath(os.path.join(os.path.expanduser(args.dir), name))
+    # Directory name: strip spaces so tools (Gradle, aapt2, xargs, ls) never
+    # choke on whitespace in the path.  The human-readable name (with spaces)
+    # is still used inside settings.gradle, strings.xml, themes, etc.
+    dir_name = name.replace(" ", "")
+    root = os.path.abspath(os.path.join(os.path.expanduser(args.dir), dir_name))
     if os.path.exists(root) and os.listdir(root):
         die(f"target directory exists and is not empty: {root}")
 
