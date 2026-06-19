@@ -616,6 +616,17 @@ shizuku_unfreeze() {
     timeout 10 adb shell dumpsys deviceidle whitelist +moe.shizuku.privileged.api >/dev/null 2>&1
 }
 
+# THE key reliability fix on MIUI/HyperOS: the system keeps killing the Shizuku *manager app*
+# process when it's backgrounded, and rish needs that app alive to mediate the binder — so a
+# cold rish call returns "Request timeout … blocked by your system". Waking the app revives it.
+# We do it the non-disruptive way: broadcast to Shizuku's exported ShizukuReceiver via Termux's
+# own `am` (NO adb, NO GUI — the app starts in the background). This is what makes Shizuku work
+# here without manually opening the app each time.
+SHIZUKU_RECEIVER="moe.shizuku.privileged.api/moe.shizuku.manager.receiver.ShizukuReceiver"
+shizuku_thaw() {
+    am broadcast -n "$SHIZUKU_RECEIVER" >/dev/null 2>&1
+}
+
 # Best-effort, LAZY repair only: make sure the package's rish_shizuku.dex matches the
 # *installed* Shizuku app. The canonical dex ships inside the Shizuku APK
 # (assets/rish_shizuku.dex); pull it over adb and overwrite the package copy if they differ.
@@ -650,29 +661,29 @@ shizuku_exec() {
 }
 
 # Probe Shizuku, echoing the uid it runs as (2000 = shell, 0 = root). Cached per-process.
-# A normal call answers in ~1s; right after a heavy build the app can be cold or briefly frozen
-# by MIUI, so keep Termux/Shizuku out of Doze (adb, non-disruptive) and retry a few quick times.
-# We deliberately do NOT foreground the Shizuku GUI here — that would yank the user off-screen
-# without helping the install. Bounded worst case (~3×20s) so it fails fast, never hangs.
+# We THAW the Shizuku app first (broadcast — wakes the MIUI-killed manager process, no GUI), so
+# the very first rish call usually answers in ~2s. Print a dot per attempt so the run never looks
+# frozen. On a "Request timeout" we thaw again and retry; a dex mismatch (UnsatisfiedLinkError/
+# librish — the only thing the slow APK-pull repair fixes) is repaired only then. Bounded worst
+# case (~30+20+20s) and it always prints progress.
 SHIZUKU_UID_CACHE=""
 shizuku_probe() {
     [ -n "$SHIZUKU_UID_CACHE" ] && { echo "$SHIZUKU_UID_CACHE"; return 0; }
     local s; s="$(shizuku_cli)" || return 1
     shizuku_unfreeze
-    # The FIRST rish call right after a heavy build boots a cold JVM under load and can take a
-    # while, so give attempt 1 a generous window; later tries are quick. Print a dot per attempt
-    # so the run never looks frozen. A dex mismatch (the only thing the slow APK-pull repair
-    # fixes) shows up as UnsatisfiedLinkError/librish — repair ONLY then, never on a plain
-    # timeout. Bounded worst case (~45+25+25s) and it always prints progress.
+    shizuku_thaw; sleep 1
     local u out i t
     for i in 1 2 3; do
-        t=$([ "$i" = 1 ] && echo 45 || echo 25)
+        t=$([ "$i" = 1 ] && echo 30 || echo 20)
         printf '.' >&2
         out="$(timeout "$t" "$s" exec 'id -u' 2>&1 | tr -d '\r')"
         u="$(printf '%s' "$out" | tail -n1)"
         case "$u" in [0-9]*) printf '\n' >&2; SHIZUKU_UID_CACHE="$u"; echo "$u"; return 0 ;; esac
         if echo "$out" | grep -qiE "UnsatisfiedLinkError|librish"; then
             printf ' (dex mismatch — repairing)' >&2; shizuku_sync_dex; continue
+        fi
+        if echo "$out" | grep -qiE "Request timeout|may be blocked"; then
+            printf ' (waking Shizuku)' >&2; shizuku_thaw; sleep 2; continue
         fi
         [ "$i" -lt 3 ] && sleep 2
     done
@@ -737,8 +748,8 @@ shizuku_install() {   # $1 apk, $2 pkg
     for i in 1 2 3; do
         out="$(timeout 120 "$s" exec "$remote" 2>&1 | tr -d '\r')"; rc=$?
         if echo "$out" | grep -qiE "Request timeout|may be blocked"; then
-            warn "Shizuku connection timed out (attempt $i/3) — retrying…"
-            sleep 2; continue
+            warn "Shizuku connection timed out (attempt $i/3) — waking Shizuku & retrying…"
+            shizuku_thaw; sleep 2; continue
         fi
         break
     done
