@@ -1231,9 +1231,20 @@ class TermuxStudio:
         except Exception as e:
             print(f"{Colors.RED}Could not query JDKs: {e}{Colors.END}")
 
-        print(f"\n{Colors.CYAN}Manage JDKs:{Colors.END}")
+        # Installed NDK + CMake (native C/C++ builds) — delegates to `studio ndk`.
+        print(f"\n{Colors.BOLD}NDK (native C/C++):{Colors.END}")
+        try:
+            subprocess.run(["studio", "ndk", "list"])
+            if self.project_path:
+                subprocess.run(["studio", "ndk", "which", self.project_path])
+        except Exception as e:
+            print(f"{Colors.RED}Could not query NDK: {e}{Colors.END}")
+
+        print(f"\n{Colors.CYAN}Manage toolchains:{Colors.END}")
         print("  i) Install a JDK (11/17/21)")
         print("  u) Set the build JDK for the loaded project")
+        print("  n) Install the aarch64 NDK (native C/C++; ~340 MB)")
+        print("  k) Set the NDK for the loaded project")
         print("  Enter) Back")
         act = input(f"{Colors.CYAN}Choice: {Colors.END}").strip().lower()
         if act == "i":
@@ -1249,6 +1260,18 @@ class TermuxStudio:
                 ver = input(f"{Colors.CYAN}JDK version for this project (11/17/21): {Colors.END}").strip()
                 if ver:
                     subprocess.run(["studio", "jdk", "use", ver, self.project_path])
+                    input("\nPress Enter to continue...")
+        elif act == "n":
+            subprocess.run(["studio", "ndk", "install"])
+            input("\nPress Enter to continue...")
+        elif act == "k":
+            if not self.project_path:
+                print(f"{Colors.RED}Load a project first.{Colors.END}")
+                time.sleep(1.5)
+            else:
+                rev = input(f"{Colors.CYAN}NDK revision/major for this project (blank = default): {Colors.END}").strip()
+                if rev:
+                    subprocess.run(["studio", "ndk", "use", rev, self.project_path])
                     input("\nPress Enter to continue...")
         return
 

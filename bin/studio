@@ -25,6 +25,14 @@ DAEMON_JVM_REL="gradle/gradle-daemon-jvm.properties"
 # Persisted across runs so 'studio run'/'logcat' can silently reconnect wireless adb.
 ADB_PORT_FILE="$STUDIO_DIR/adb_connect_port"   # last successful wireless connect port
 LAST_PKG_FILE="$STUDIO_DIR/last_pkg"           # package of the last 'studio run' (for logcat)
+NDK_ROOT="$SDK_DIR/ndk"                         # side-by-side NDKs (AGP auto-discovers these)
+NDK_PIN_DIR="$STUDIO_DIR/ndk"                   # per-project NDK pins (out of repo)
+NDK_DEFAULT_FILE="$STUDIO_DIR/ndk-default"      # global default NDK dir
+# aarch64-native NDK repackaged to run on Termux. Google's official NDK ships an x86_64 Linux
+# host toolchain that cannot run on this device (same problem the bundled aapt2 had); this
+# build (lzhiyong/termux-ndk) runs natively on aarch64. Only this asset works here.
+NDK_AARCH64_URL="https://github.com/lzhiyong/termux-ndk/releases/download/android-ndk/android-ndk-r29-aarch64.7z"
+NDK_AARCH64_LABEL="r29"
 
 info()  { echo -e "${CYAN}$*${NC}"; }
 ok()    { echo -e "${GREEN}✔ $*${NC}"; }
@@ -287,6 +295,269 @@ studio_jdk() {
     esac
 }
 
+# ----------------------------------------------------------------- NDK management
+#
+# Native (C/C++) Android builds need an NDK + CMake. Google's official NDK ships an x86_64
+# Linux host toolchain that CANNOT run on this aarch64 device — exactly the problem the
+# bundled aapt2 had. We instead install an aarch64-native NDK (lzhiyong/termux-ndk) under
+# $SDK/ndk/<revision> so AGP discovers it side-by-side, and point AGP's CMake at Termux's own
+# cmake/ninja via cmake.dir. None of this touches the repo: ndk.dir/cmake.dir go in the
+# git-ignored local.properties, and per-project NDK pins live out-of-repo (like the JDK pins).
+
+# Read an NDK's revision (e.g. 29.0.13846066) from its source.properties.
+ndk_revision() {
+    local sp="$1/source.properties"
+    [ -f "$sp" ] && sed -n 's/^Pkg.Revision *= *//p' "$sp" | tr -d '\r' | head -n1
+}
+
+# Print each installed NDK dir (one per line), oldest -> newest. All dirs share the same
+# parent, so a plain version sort orders them by revision.
+ndk_installed_dirs() {
+    [ -d "$NDK_ROOT" ] || return 0
+    local d
+    for d in "$NDK_ROOT"/*/; do
+        d="${d%/}"; [ -f "$d/source.properties" ] && echo "$d"
+    done | sort -V
+}
+
+# Highest-revision installed NDK dir.
+ndk_latest_dir() { ndk_installed_dirs | tail -n1; }
+
+# The global-default NDK dir: explicit pin if still valid, else the highest installed.
+ndk_default_dir() {
+    if [ -f "$NDK_DEFAULT_FILE" ]; then
+        local p; p="$(cat "$NDK_DEFAULT_FILE")"
+        [ -d "$p" ] && [ -f "$p/source.properties" ] && { echo "$p"; return 0; }
+    fi
+    ndk_latest_dir
+}
+
+# Resolve a selector (full revision 29.0.x, a major like 29, a dir name, or rNN) to an
+# installed NDK dir. With no selector, returns the default.
+ndk_resolve() {
+    local sel="$1" d rev
+    [ -z "$sel" ] && { ndk_default_dir; return $?; }
+    case "$sel" in r[0-9]*) sel="${sel#r}"; sel="${sel%%[!0-9]*}" ;; esac
+    while IFS= read -r d; do
+        [ -n "$d" ] || continue
+        rev="$(ndk_revision "$d")"
+        [ "$rev" = "$sel" ] && { echo "$d"; return 0; }
+        [ "$(basename "$d")" = "$sel" ] && { echo "$d"; return 0; }
+        case "$rev" in "$sel".*) echo "$d"; return 0 ;; esac    # major-version match
+    done < <(ndk_installed_dirs)
+    return 1
+}
+
+ndk_pin_file() { local key; key=$(echo "$1" | sed 's#[/ ]#_#g'); echo "$NDK_PIN_DIR/$key"; }
+
+# Which NDK dir a build should use: per-project pin > global default. May print empty.
+resolve_build_ndk() {
+    local proj="$1" pf; pf="$(ndk_pin_file "$proj")"
+    if [ -f "$pf" ]; then
+        local p; p="$(cat "$pf")"
+        [ -d "$p" ] && [ -f "$p/source.properties" ] && { echo "$p"; return 0; }
+    fi
+    ndk_default_dir
+}
+
+# Directory AGP should use as its CMake (cmake.dir expects <dir>/bin/cmake). Points at
+# Termux's cmake so AGP never tries to run its bundled x86_64 cmake. Prints "" if none.
+cmake_dir() {
+    local c; c="$(command -v cmake)" || return 0
+    echo "${c%/bin/cmake}"
+}
+
+# Does this project build native code (so it needs the NDK)? Covers both back-ends AGP
+# supports: CMake (CMakeLists.txt) and ndk-build (Android.mk / Application.mk).
+project_is_native() {
+    local proj="$1"
+    find "$proj" -type d -name build -prune -o \
+         \( -name CMakeLists.txt -o -name Android.mk -o -name Application.mk \) -print 2>/dev/null \
+         | head -n1 | grep -q . && return 0
+    grep -rqsE 'externalNativeBuild|ndkVersion|ndkBuild|ndkPath' \
+        "$proj"/build.gradle "$proj"/build.gradle.kts \
+        "$proj"/*/build.gradle "$proj"/*/build.gradle.kts 2>/dev/null
+}
+
+# Set key=val in local.properties (git-ignored), replacing any existing line. No-op if equal.
+set_local_prop() {   # $1 proj, $2 key, $3 val
+    local lp="$1/local.properties" key="$2" val="$3"
+    touch "$lp"
+    if grep -q "^$key=" "$lp" 2>/dev/null; then
+        local cur; cur="$(grep "^$key=" "$lp" | head -n1 | cut -d= -f2-)"
+        [ "$cur" = "$val" ] && return 0
+        sed -i "s#^$key=.*#$key=$val#" "$lp"
+    else
+        echo "$key=$val" >> "$lp"
+    fi
+}
+
+# For native projects, point AGP at our aarch64 NDK + Termux CMake via the git-ignored
+# local.properties (the repo is never touched). No-op for pure-JVM projects.
+ensure_native_props() {
+    local proj="$1"
+    project_is_native "$proj" || return 0
+    local ndk; ndk="$(resolve_build_ndk "$proj")"
+    if [ -z "$ndk" ]; then
+        warn "this project builds native code but no NDK is installed."
+        echo -e "   Install the aarch64 NDK:  ${BOLD}studio ndk install${NC}"
+        return 0
+    fi
+    set_local_prop "$proj" "ndk.dir" "$ndk"
+    local ck; ck="$(cmake_dir)"
+    [ -n "$ck" ] && set_local_prop "$proj" "cmake.dir" "$ck"
+    command -v ninja >/dev/null || warn "ninja not found (pkg install ninja) — CMake builds need it"
+    info "native build: NDK $(ndk_revision "$ndk") + CMake $(cmake --version 2>/dev/null | head -1 | sed 's/cmake version //')"
+}
+
+ndk_list() {
+    echo -e "${CYAN}===== INSTALLED NDKs =====${NC}"
+    local def; def="$(ndk_default_dir)"
+    local found=0 d rev
+    while IFS= read -r d; do
+        [ -n "$d" ] || continue
+        found=1; rev="$(ndk_revision "$d")"
+        local mark=""; [ "$d" = "$def" ] && mark=" ${GREEN}(default)${NC}"
+        echo -e "  ${BOLD}${rev:-?}${NC}${mark}"
+        echo -e "     ${CYAN}$d${NC}"
+    done < <(ndk_installed_dirs)
+    [ "$found" = "0" ] && warn "no NDK installed under $NDK_ROOT"
+    echo
+    echo -e "  CMake: ${CYAN}$(command -v cmake || echo 'not found')${NC} $(cmake --version 2>/dev/null | head -1 | sed 's/cmake version //')"
+    echo -e "  Ninja: ${CYAN}$(command -v ninja || echo 'not found')${NC}"
+    echo
+    echo -e "Installable (aarch64-native, runs on Termux): ${GREEN}${NDK_AARCH64_LABEL}${NC}"
+    echo -e "  ${BOLD}studio ndk install${NC}   (downloads ~340 MB from lzhiyong/termux-ndk)"
+}
+
+# Make the toolchain binaries executable — 7z extraction can drop the exec bit. Covers both
+# the CMake/clang toolchain AND the ndk-build (Android.mk) path: the top-level ndk-build/
+# ndk-* wrappers, the make-based scripts under build/, and the bundled prebuilt make/awk live
+# OUTSIDE any bin/ dir, so chmod them explicitly or ndk-build fails with "Permission denied".
+ndk_fix_perms() {
+    local dest="$1"
+    # clang/llvm + prebuilt make/awk (all in some .../bin/ dir) and shared objects
+    find "$dest" -type d -name bin -exec sh -c 'chmod +x "$1"/* 2>/dev/null' _ {} \; 2>/dev/null
+    find "$dest" -type f \( -name '*.so' -o -name '*.so.*' \) -exec chmod +x {} + 2>/dev/null
+    # ndk-build / ndk-gdb / ndk-stack / ndk-which wrappers at the NDK root
+    find "$dest" -maxdepth 1 -type f -name 'ndk-*' -exec chmod +x {} + 2>/dev/null
+    # the real ndk-build script + helper shell/py tools under build/
+    [ -d "$dest/build" ] && find "$dest/build" -type f \
+        \( -name 'ndk-build' -o -name '*.sh' -o -name '*.py' -o -name 'gen-*' \) \
+        -exec chmod +x {} + 2>/dev/null
+}
+
+# Rewrite NDK script shebangs to Termux interpreters. Android has NO /usr/bin/env and NO
+# /bin/bash, so ndk-build (Android.mk) — whose scripts use `#!/usr/bin/env bash` — and the
+# python helpers (ndk-gdb/ndk-stack) die with "bad interpreter: No such file or directory".
+# CMake projects never hit this (cmake.dir drives clang directly); ndk-build ones must have it.
+# One-time, at install. Maps env/abs-path bash|sh|python shebangs to Termux's, keeping any args.
+ndk_fix_shebangs() {
+    local dest="$1" bash_p py_p f n=0
+    bash_p="$(command -v bash)"; py_p="$(command -v python3 || command -v python)"
+    [ -n "$bash_p" ] || { warn "bash not found — cannot fix ndk-build shebangs"; return 0; }
+    info "Fixing NDK script shebangs for Termux (ndk-build/Android.mk needs this)…"
+    while IFS= read -r f; do
+        sed -i -E \
+          -e "1s|^#!\s*/usr/bin/env\s+bash|#!$bash_p|" \
+          -e "1s|^#!\s*/bin/bash|#!$bash_p|" \
+          -e "1s|^#!\s*/usr/bin/env\s+sh\b|#!$bash_p|" \
+          -e "1s|^#!\s*/usr/bin/env\s+python[0-9.]*|#!${py_p:-$bash_p}|" \
+          -e "1s|^#!\s*/usr/bin/python[0-9.]*|#!${py_p:-$bash_p}|" \
+          "$f" 2>/dev/null && n=$((n+1))
+    done < <(grep -rIlE '^#!\s*(/usr/bin/env|/bin/bash|/usr/bin/python)' "$dest" 2>/dev/null)
+    ok "patched shebangs in $n NDK script(s) for ndk-build"
+}
+
+ndk_install() {
+    local sel="${1:-}"
+    case "$sel" in
+        ""|r29|29|29.*|latest) : ;;
+        *) warn "only the aarch64-native ${NDK_AARCH64_LABEL} build is available for Termux; installing that." ;;
+    esac
+    local existing; existing="$(ndk_resolve "${sel:-29}" 2>/dev/null)"
+    if [ -n "$existing" ]; then ok "NDK already installed: $(ndk_revision "$existing") ($existing)"; return 0; fi
+
+    command -v 7z >/dev/null 2>&1 || { info "Installing p7zip (to extract the NDK)…"; pkg install -y p7zip || { err "pkg install p7zip failed"; return 1; }; }
+    command -v cmake >/dev/null 2>&1 || { info "Installing cmake…"; pkg install -y cmake || warn "cmake install failed — native builds need it"; }
+    command -v ninja >/dev/null 2>&1 || { info "Installing ninja…"; pkg install -y ninja || warn "ninja install failed — CMake builds need it"; }
+
+    mkdir -p "$NDK_ROOT" "$STUDIO_DIR"
+    local tmp; tmp="$(mktemp -d "$STUDIO_DIR/ndk-dl.XXXXXX")" || { err "mktemp failed"; return 1; }
+    local arc="$tmp/ndk.7z"
+    info "Downloading aarch64 NDK ${NDK_AARCH64_LABEL} (~340 MB)…"
+    if ! curl -fL --progress-bar "$NDK_AARCH64_URL" -o "$arc"; then
+        err "download failed"; rm -rf "$tmp"; return 1
+    fi
+    info "Extracting (this takes a minute)…"
+    if ! 7z x -y -o"$tmp" "$arc" >/dev/null; then
+        err "extraction failed"; rm -rf "$tmp"; return 1
+    fi
+    rm -f "$arc"
+    local src; src="$(find "$tmp" -maxdepth 3 -name source.properties -printf '%h\n' 2>/dev/null | head -n1)"
+    [ -z "$src" ] && { err "couldn't find an NDK inside the archive"; rm -rf "$tmp"; return 1; }
+    local rev; rev="$(ndk_revision "$src")"; [ -z "$rev" ] && rev="$(basename "$src")"
+    local dest="$NDK_ROOT/$rev"
+    rm -rf "$dest"
+    mv "$src" "$dest" || { err "could not move NDK into place"; rm -rf "$tmp"; return 1; }
+    rm -rf "$tmp"
+    ndk_fix_perms "$dest"
+    ndk_fix_shebangs "$dest"
+    echo "$dest" > "$NDK_DEFAULT_FILE"
+    ok "NDK $rev installed at $dest"
+    echo -e "Native projects now build automatically — both ${BOLD}CMake${NC} (cmake.dir → Termux cmake)"
+    echo -e "and ${BOLD}ndk-build${NC} (Android.mk, via the NDK's own make) are wired up at build time."
+}
+
+ndk_use() {
+    local sel="$1" where="${2:-}"
+    [ -z "$sel" ] && { err "usage: studio ndk use <revision|major> [project-dir]"; return 1; }
+    local dir; dir="$(ndk_resolve "$sel")" || { err "NDK not found: $sel (install it with 'studio ndk install')"; return 1; }
+    if [ -n "$where" ]; then
+        local proj; proj="$(resolve_project "$where")" || return 1
+        mkdir -p "$NDK_PIN_DIR"; echo "$dir" > "$(ndk_pin_file "$proj")"
+        ok "pinned NDK for $(basename "$proj"): $(ndk_revision "$dir")"
+        echo -e "  (stored out-of-repo in $NDK_PIN_DIR — git/Studio config untouched)"
+    else
+        echo "$dir" > "$NDK_DEFAULT_FILE"
+        ok "default NDK set to $(ndk_revision "$dir") ($dir)"
+    fi
+}
+
+ndk_which() {
+    local proj; proj="$(resolve_project "${1:-$PWD}" 2>/dev/null)" || proj="${1:-$PWD}"
+    local dir; dir="$(resolve_build_ndk "$proj")"
+    if project_is_native "$proj" 2>/dev/null; then
+        if [ -n "$dir" ]; then
+            info "Native project — would build with NDK $(ndk_revision "$dir") ($dir)"
+        else
+            warn "Native project but no NDK installed — run 'studio ndk install'"
+        fi
+    else
+        info "This project has no native code; the NDK is unused."
+        [ -n "$dir" ] && echo -e "  (default NDK if it adds native code: $(ndk_revision "$dir"))"
+    fi
+}
+
+ndk_remove() {
+    local sel="$1"; [ -z "$sel" ] && { err "usage: studio ndk remove <revision|major>"; return 1; }
+    local dir; dir="$(ndk_resolve "$sel")" || { err "NDK not found: $sel"; return 1; }
+    rm -rf "$dir" && ok "removed NDK $(basename "$dir")"
+    [ -f "$NDK_DEFAULT_FILE" ] && [ "$(cat "$NDK_DEFAULT_FILE")" = "$dir" ] && rm -f "$NDK_DEFAULT_FILE"
+}
+
+studio_ndk() {
+    local sub="${1:-list}"; shift 2>/dev/null
+    case "$sub" in
+        list|ls|"")          ndk_list ;;
+        install|add|i)       ndk_install "$@" ;;
+        use|set)             ndk_use "$@" ;;
+        which|current)       ndk_which "$@" ;;
+        remove|rm|uninstall) ndk_remove "$@" ;;
+        *) err "usage: studio ndk {list|install [ver]|use <ver> [project]|which [project]|remove <ver>}"; return 1 ;;
+    esac
+}
+
 # ----------------------------------------------------------------- build
 
 studio_build() {
@@ -354,6 +625,8 @@ studio_build() {
 
     check_global_gradle
     ensure_local_props "$proj"
+    # Native (C/C++) projects: point AGP at our aarch64 NDK + Termux CMake via local.properties.
+    ensure_native_props "$proj"
 
     # Temporarily move the Studio daemon-JVM pin aside (it forces a JetBrains JDK that
     # Termux lacks and trips Gradle's native arch lookup). Restored on exit so git keeps it.
@@ -743,6 +1016,9 @@ shizuku_install() {   # $1 apk, $2 pkg
     local staged; staged="$(ensure_installable_apk "$apk")"
     local rtmp="/data/local/tmp/studio-install-$$.apk"
     local remote="cp '$staged' '$rtmp' && pm install -r -d -t '$rtmp'; __r=\$?; rm -f '$rtmp'; exit \$__r"
+    # Wake the MIUI-killed Shizuku app up front (broadcast, no GUI/adb) so the very first install
+    # attempt lands instantly instead of waiting on a cold binder.
+    shizuku_unfreeze; shizuku_thaw
     info "Installing via Shizuku (pm install)…"
     local out rc i
     for i in 1 2 3; do
@@ -1151,6 +1427,9 @@ show_env() {
     echo -e "  java:   ${CYAN}$(java -version 2>&1 | head -1)${NC}"
     echo -e "  gradle: ${CYAN}$(gradle -v 2>/dev/null | grep '^Gradle ' | head -1)${NC}"
     echo -e "  aapt2:  ${CYAN}$(grep -h aapt2FromMavenOverride ~/.gradle/gradle.properties 2>/dev/null | cut -d= -f2 || which aapt2)${NC}"
+    local ndkd; ndkd="$(ndk_default_dir)"
+    echo -e "  ndk:    ${CYAN}$( [ -n "$ndkd" ] && echo "$(ndk_revision "$ndkd")  ($ndkd)" || echo 'none (studio ndk install)' )${NC}"
+    echo -e "  cmake:  ${CYAN}$(command -v cmake >/dev/null && cmake --version 2>/dev/null | head -1 | sed 's/cmake version //' || echo 'not installed')${NC}"
 }
 
 doctor() {
@@ -1170,6 +1449,14 @@ doctor() {
     [ -f "$COMPAT_PY" ] && ok "compatibility adapter present" || warn "missing $COMPAT_PY (imported-project auto-adapt disabled)"
     local sm="$SDK_DIR/cmdline-tools/latest/bin/sdkmanager"
     [ -x "$sm" ] && ok "sdkmanager present (auto-installs missing SDK levels)" || warn "sdkmanager missing — can't auto-install SDK platforms"
+    local ndkd; ndkd="$(ndk_default_dir)"
+    if [ -n "$ndkd" ]; then
+        ok "NDK: $(ndk_revision "$ndkd") at $ndkd (native C/C++ builds enabled)"
+        command -v cmake >/dev/null && ok "cmake: $(cmake --version 2>/dev/null | head -1 | sed 's/cmake version //')" || warn "cmake missing (pkg install cmake) — native builds need it"
+        command -v ninja >/dev/null || warn "ninja missing (pkg install ninja) — CMake builds need it"
+    else
+        warn "no NDK installed — native (C/C++) builds unavailable; run 'studio ndk install' (aarch64-native)"
+    fi
     if adb_device_ready; then
         ok "adb device connected — 'studio run' uses the real install/launch/logcat flow"
         adb devices 2>/dev/null | grep -vE '^List of|^$' | sed 's/^/    /'
@@ -1201,6 +1488,7 @@ usage() {
     echo -e "  ${GREEN}adb${NC}  {pair|connect [port]|disconnect|status}   Wireless debugging (Android 11+, no root)"
     echo -e "  ${GREEN}shizuku${NC} {status|open|sync|install <apk>}   Install via Shizuku (no adb pairing, no root)"
     echo -e "  ${GREEN}jdk${NC}  {list|install <ver>|use <ver> [project]|which}   Manage build JDKs (11/17/21)"
+    echo -e "  ${GREEN}ndk${NC}  {list|install [ver]|use <ver> [project]|which|remove <ver>}   Manage the aarch64 NDK (native C/C++)"
     echo -e "  ${GREEN}logcat${NC} [pkg|path] [-- adb-logcat-args]   Stream the app's debug logs (needs adb)"
     echo -e "  ${GREEN}git${NC} [path] <args> | ${GREEN}push${NC} [path]   Run git with Studio config restored"
     echo
@@ -1223,6 +1511,8 @@ usage() {
     echo -e "  studio run ~/projects/MyApp --shizuku --no-launch   # headless build+install for agents/CI"
     echo -e "  studio gradle ~/projects/MyApp testDebugUnitTest    # run unit tests (Termux toolchain)"
     echo -e "  studio gradle ~/projects/MyApp :app:lintDebug       # lint a module"
+    echo -e "  studio ndk install                  # one-time aarch64 NDK + CMake setup (native C/C++)"
+    echo -e "  studio build ~/projects/NativeApp   # native modules build automatically once NDK is installed"
     echo -e "  studio adb pair                     # one-time Wireless debugging setup (then auto-reconnects)"
     echo -e "  studio logcat                       # tail logs of the last app you ran"
     echo -e "  studio push ~/projects/MyApp        # = git push, Studio config intact"
@@ -1243,6 +1533,7 @@ case "$cmd" in
     adb)          studio_adb "$@" ;;
     shizuku|rish) studio_shizuku "$@" ;;
     jdk|java)     studio_jdk "$@" ;;
+    ndk)          studio_ndk "$@" ;;
     logcat|log)   studio_logcat "$@" ;;
     git)          studio_git "$@" ;;
     push)         studio_git "$@" push ;;
