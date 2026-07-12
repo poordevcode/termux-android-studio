@@ -164,14 +164,16 @@ def main():
                 continue
             seq += 1
             sent = "%d_%d" % (os.getpid(), seq)
-            # Group the command so 'cd x; y' etc. behave; sentinel carries its rc.
-            os.write(fd, ("{ %s\n}; echo __SENT_%s_$?\n" % (cmd, sent)).encode())
+            # Run in a SUBSHELL so a client command containing `exit` (or cd/env
+            # changes) can never kill or dirty the held session; the sentinel
+            # still carries the command's exit code.
+            os.write(fd, ("( %s\n ); echo __SENT_%s_$?\n" % (cmd, sent)).encode())
             pat = re.compile(r"^__SENT_%s_(\d+)$" % sent)
             m, out = read_until(fd, pat, time.time() + CMD_TIMEOUT)
             # Drop prompt/control noise and any echoed copies of our own writes
             # (the remote pty echoes input despite stty -echo; the echoed first
             # line is exactly "{ <cmd>").
-            echoed = ("{ " + cmd).strip()
+            echoed = ("( " + cmd).strip()
             clean = "\n".join(
                 l for l in out.splitlines()
                 if l.strip() and "__SENT_" not in l and "__READY_" not in l

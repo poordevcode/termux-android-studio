@@ -1128,6 +1128,18 @@ sys.exit(rc if 0 <= rc < 256 else 255)
 PYEOF
 }
 
+# One-shot hardening, run as uid 2000 THROUGH the bridge (no adb needed): neutralise the
+# Android 12+ phantom-process killer (it culls shell-spawned children — rish sessions,
+# gradle daemons — and is a prime suspect for installs that hang mid-transfer), keep
+# Shizuku + Termux out of Doze and in the ACTIVE standby bucket. All best-effort; settings
+# stick until reboot (deviceidle whitelist persists). Idea credit: the keepalive/fix
+# scripts in github.com/jecis-repos/termux-shizuku-tools, adapted to run over our bridge.
+shizuku_harden() {
+    shizuku_bridge_alive || return 0
+    # NB: the bridge protocol is ONE command line per connection — keep this a single line.
+    shizuku_bridge_exec 'device_config put activity_manager max_phantom_processes 2147483647 2>/dev/null; device_config put activity_manager_native_boot max_phantom_processes 2147483647 2>/dev/null; settings put global settings_enable_monitor_phantom_procs false 2>/dev/null; dumpsys deviceidle whitelist +com.termux >/dev/null 2>&1; dumpsys deviceidle whitelist +moe.shizuku.privileged.api >/dev/null 2>&1; am set-standby-bucket com.termux active 2>/dev/null; am set-standby-bucket moe.shizuku.privileged.api active 2>/dev/null; true' 20 >/dev/null 2>&1 || true
+}
+
 # Bring the bridge up if it isn't. Thaws the manager app first — starting the bridge is
 # the ONLY step that needs it; once the handshake lands, the app can die again for good.
 shizuku_bridge_ensure() {
@@ -1142,11 +1154,11 @@ shizuku_bridge_ensure() {
         setsid python3 "$SHIZUKU_BRIDGE_PY" >/dev/null 2>&1 &
         bpid=$!
         for w in $(seq 1 60); do
-            shizuku_bridge_alive && return 0
+            shizuku_bridge_alive && { shizuku_harden; return 0; }
             kill -0 "$bpid" 2>/dev/null || break   # handshake failed, bridge exited
             sleep 0.5
         done
-        shizuku_bridge_alive && return 0
+        shizuku_bridge_alive && { shizuku_harden; return 0; }
         # A dex mismatch is the one failure the slow APK-pull repair actually fixes.
         grep -qiE 'UnsatisfiedLinkError|librish' "$SHIZUKU_DDIR/bridge.log" 2>/dev/null \
             && { printf ' (dex mismatch — repairing)' >&2; shizuku_sync_dex; }
@@ -1271,18 +1283,21 @@ shizuku_install() {   # $1 apk, $2 pkg
     # output. The reliable route (what `adb install` does) is: have the Shizuku shell copy the
     # APK into /data/local/tmp (which uid 2000 owns) and install from there.
     local was_installed=0
-    [ -n "$pkg" ] && timeout 25 "$s" exec "pm path $pkg" 2>/dev/null | grep -qi "^package:" \
+    [ -n "$pkg" ] && shizuku_exec "pm path $pkg" 20 2>/dev/null | grep -qi "package:" \
         && was_installed=1
     local staged; staged="$(ensure_installable_apk "$apk")"
     local rtmp="/data/local/tmp/studio-install-$$.apk"
-    local remote="cp '$staged' '$rtmp' && pm install -r -d -t '$rtmp'; __r=\$?; rm -f '$rtmp'; exit \$__r"
-    # Wake the MIUI-killed Shizuku app up front (broadcast, no GUI/adb) so the very first install
-    # attempt lands instantly instead of waiting on a cold binder.
-    shizuku_unfreeze; shizuku_thaw
+    # No `exit` here: through the bridge that would end the held session; `(exit $__r)`
+    # sets the exit code the same way for both the bridge and one-shot rish.
+    local remote="cp '$staged' '$rtmp' && pm install -r -d -t '$rtmp'; __r=\$?; rm -f '$rtmp'; (exit \$__r)"
+    # Everything below goes through shizuku_exec, i.e. the held-binder bridge when it's up —
+    # immune to the manager app being frozen/killed mid-install (the old direct rish call
+    # here was the last remaining fresh-handshake path, and the one that used to hang).
+    shizuku_thaw
     info "Installing via Shizuku (pm install)…"
     local out rc i
     for i in 1 2 3; do
-        out="$(timeout 120 "$s" exec "$remote" 2>&1 | tr -d '\r')"; rc=$?
+        out="$(shizuku_exec "$remote" 150 2>&1 | tr -d '\r')"; rc=$?
         if echo "$out" | grep -qiE "Request timeout|may be blocked"; then
             warn "Shizuku connection timed out (attempt $i/3) — waking Shizuku & retrying…"
             shizuku_thaw; sleep 2; continue
@@ -1292,7 +1307,7 @@ shizuku_install() {   # $1 apk, $2 pkg
     # Positive verification — pm said Success, OR the package now resolves through Shizuku.
     if echo "$out" | grep -qi "Success" \
        || { [ "$was_installed" = "0" ] && [ -n "$pkg" ] \
-            && timeout 25 "$s" exec "pm path $pkg" 2>/dev/null | grep -qi "^package:"; }; then
+            && shizuku_exec "pm path $pkg" 20 2>/dev/null | grep -qi "package:"; }; then
         ok "installed via Shizuku${pkg:+ ($pkg)}"
         return 0
     fi
