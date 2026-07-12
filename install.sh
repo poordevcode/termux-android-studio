@@ -66,12 +66,20 @@ confirm "Proceed with installation?" || { info "cancelled"; exit 0; }
 
 # ───────────────────────────────────────────────── 1. Termux packages
 step "1/6  Installing Termux packages"
-pkg update -y && pkg upgrade -y || warn "pkg update had warnings (continuing)"
 # Runtime deps. openjdk-11 too so studio's auto-JDK-selection has the full 11/17/21 set.
-PKGS=(openjdk-21 openjdk-17 openjdk-11 gradle aapt2 d8 apksigner android-tools termux-api git curl python which file)
+PKGS=(openjdk-21 openjdk-17 gradle aapt2 d8 apksigner android-tools termux-api git curl python which file)
 [ "$BUILD_AAPT2" = "1" ] && PKGS+=(clang cmake ninja binutils protobuf libexpat zlib)
-info "installing: ${PKGS[*]}"
-pkg install -y "${PKGS[@]}" || { err "package installation failed"; exit 1; }
+MISSING_PKGS=()
+for p in "${PKGS[@]}"; do
+    dpkg -s "$p" >/dev/null 2>&1 || MISSING_PKGS+=("$p")
+done
+if [ "${#MISSING_PKGS[@]}" -gt 0 ]; then
+    pkg update -y && pkg upgrade -y || warn "pkg update had warnings (continuing)"
+    info "installing: ${MISSING_PKGS[*]}"
+    pkg install -y "${MISSING_PKGS[@]}" || { err "package installation failed"; exit 1; }
+else
+    info "required packages already installed; skipping pkg install"
+fi
 ok "packages installed"
 java -version 2>&1 | head -1 | sed 's/^/    /'
 gradle -v 2>/dev/null | grep '^Gradle ' | head -1 | sed 's/^/    /'
