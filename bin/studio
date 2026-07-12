@@ -1069,11 +1069,103 @@ shizuku_sync_dex() {
     rm -rf "$tmp"
 }
 
-# Run a command through the shizuku CLI, returning its stdout + the remote exit code, always
-# time-boxed. $1 = command string, $2 = timeout seconds (default 20). Retries/thawing are the
-# caller's job (see shizuku_probe) so a simple per-call helper never compounds delays.
+# ---------------------------------------------------------- persistent bridge
+#
+# MT-Manager-like behaviour: apps that request the Shizuku binder ONCE and hold it keep
+# working even when the system freezes/kills the Shizuku *manager app* (the server, uid
+# 2000, stays up). rish spawns a fresh client per command, so every plain `shizuku exec`
+# re-runs the fragile handshake through that app — the source of the intermittent
+# "Request timeout" while MT Manager works fine. shizuku_bridge.py opens ONE rish session
+# under a pty (the only moment the app must be reachable) and then serves commands over a
+# UNIX socket for as long as it lives. Everything below prefers the bridge and falls back
+# to one-shot rish only when the bridge is down.
+
+SHIZUKU_DDIR="$STUDIO_DIR/shizuku-daemon"
+SHIZUKU_SOCK="$SHIZUKU_DDIR/bridge.sock"
+SHIZUKU_BRIDGE_PY="$STUDIO_DIR/shizuku_bridge.py"
+
+# Bridge process alive? (pid file is written only after a successful binder handshake.)
+shizuku_bridge_alive() {
+    [ -S "$SHIZUKU_SOCK" ] && [ -f "$SHIZUKU_DDIR/bridge.pid" ] \
+        && kill -0 "$(cat "$SHIZUKU_DDIR/bridge.pid" 2>/dev/null)" 2>/dev/null
+}
+
+shizuku_bridge_stop() {
+    [ -f "$SHIZUKU_DDIR/bridge.pid" ] && kill "$(cat "$SHIZUKU_DDIR/bridge.pid")" 2>/dev/null
+    rm -f "$SHIZUKU_DDIR/bridge.pid" "$SHIZUKU_SOCK"
+}
+
+# Send one command through the held-binder bridge. Prints the remote output; returns the
+# remote exit code (124 = socket timeout / bridge unreachable).
+shizuku_bridge_exec() {   # $1 cmd, $2 timeout-seconds (default 25)
+    python3 - "$SHIZUKU_SOCK" "${2:-25}" "$1" <<'PYEOF'
+import socket, sys
+path, t, cmd = sys.argv[1], float(sys.argv[2]), sys.argv[3]
+try:
+    s = socket.socket(socket.AF_UNIX)
+    s.settimeout(t)
+    s.connect(path)
+    s.sendall(cmd.encode() + b"\n")
+    buf = b""
+    while True:
+        d = s.recv(65536)
+        if not d:
+            break
+        buf += d
+except (OSError, socket.timeout):
+    sys.exit(124)
+lines = buf.decode("utf-8", "replace").splitlines()
+rc = 255
+if lines and lines[-1].startswith("__RC "):
+    try:
+        rc = int(lines[-1].split()[1])
+    except (ValueError, IndexError):
+        pass
+    lines = lines[:-1]
+if lines:
+    print("\n".join(lines))
+sys.exit(rc if 0 <= rc < 256 else 255)
+PYEOF
+}
+
+# Bring the bridge up if it isn't. Thaws the manager app first — starting the bridge is
+# the ONLY step that needs it; once the handshake lands, the app can die again for good.
+shizuku_bridge_ensure() {
+    shizuku_bridge_alive && return 0
+    [ -f "$SHIZUKU_BRIDGE_PY" ] || return 1
+    command -v python3 >/dev/null || return 1
+    local i w bpid
+    for i in 1 2 3; do
+        printf '.' >&2
+        shizuku_thaw; sleep 1
+        shizuku_bridge_stop
+        setsid python3 "$SHIZUKU_BRIDGE_PY" >/dev/null 2>&1 &
+        bpid=$!
+        for w in $(seq 1 60); do
+            shizuku_bridge_alive && return 0
+            kill -0 "$bpid" 2>/dev/null || break   # handshake failed, bridge exited
+            sleep 0.5
+        done
+        shizuku_bridge_alive && return 0
+        # A dex mismatch is the one failure the slow APK-pull repair actually fixes.
+        grep -qiE 'UnsatisfiedLinkError|librish' "$SHIZUKU_DDIR/bridge.log" 2>/dev/null \
+            && { printf ' (dex mismatch — repairing)' >&2; shizuku_sync_dex; }
+        # Second miss: maybe the server itself is down — start it over adb if we can.
+        [ "$i" = "2" ] && shizuku_start_server
+    done
+    return 1
+}
+
+# Run a command with shell privileges: through the held-binder bridge when it's up (immune
+# to the manager app being frozen/killed), else a one-shot rish call. $1 = command string,
+# $2 = timeout seconds (default 20).
 shizuku_exec() {
-    local cmd="$1" t="${2:-20}" s; s="$(shizuku_cli)" || return 127
+    local cmd="$1" t="${2:-20}"
+    if shizuku_bridge_alive; then
+        shizuku_bridge_exec "$cmd" "$t"
+        return $?
+    fi
+    local s; s="$(shizuku_cli)" || return 127
     timeout "$t" "$s" exec "$cmd" 2>&1
 }
 
@@ -1095,34 +1187,22 @@ shizuku_start_server() {
 }
 
 # Probe Shizuku, echoing the uid it runs as (2000 = shell, 0 = root). Cached per-process.
-# We THAW the Shizuku app first (broadcast — wakes the MIUI-killed manager process, no GUI), so
-# the first rish call usually answers in ~2s; one thaw-retry covers a slow wake. rish itself
-# gives up after ~7s ("Request timeout", exit 0!) so long timeout windows only waste time:
-# after TWO quick misses the server is simply not running, and no retry can fix that — we
-# either start it ourselves over adb (self-heal) or fail fast. A dex mismatch
-# (UnsatisfiedLinkError/librish — the only thing the slow APK-pull repair fixes) is repaired
-# only when seen. Fail path without adb ≈ 18s; happy path ~2s; always prints progress.
+# Runs on the persistent bridge: if it's already up this is instant and works even with the
+# manager app frozen/killed; otherwise the bridge is (re)started — thaw + handshake — which
+# is the only moment the manager app must be reachable. Always prints progress.
 SHIZUKU_UID_CACHE=""
 shizuku_probe() {
     [ -n "$SHIZUKU_UID_CACHE" ] && { echo "$SHIZUKU_UID_CACHE"; return 0; }
-    local s; s="$(shizuku_cli)" || return 1
+    shizuku_cli >/dev/null || return 1
     shizuku_unfreeze
-    shizuku_thaw; sleep 1
-    local u out i
-    for i in 1 2 3; do
-        printf '.' >&2
-        out="$(timeout 12 "$s" exec 'id -u' 2>&1 | tr -d '\r')"
-        u="$(printf '%s' "$out" | tail -n1)"
-        case "$u" in [0-9]*) printf '\n' >&2; SHIZUKU_UID_CACHE="$u"; echo "$u"; return 0 ;; esac
-        if echo "$out" | grep -qiE "UnsatisfiedLinkError|librish"; then
-            printf ' (dex mismatch — repairing)' >&2; shizuku_sync_dex; continue
-        fi
-        case "$i" in
-            1) printf ' (waking Shizuku)' >&2; shizuku_thaw; sleep 2 ;;
-            2) # Two quick misses -> the server isn't running. Self-heal via adb or stop NOW.
-               shizuku_start_server || { printf '\n' >&2; return 1; }
-               sleep 2 ;;
+    local i u
+    for i in 1 2; do
+        shizuku_bridge_ensure || { printf '\n' >&2; return 1; }
+        u="$(shizuku_bridge_exec 'id -u' 15 | tr -d '\r' | tail -n1)"
+        case "$u" in
+            [0-9]*) printf '\n' >&2; SHIZUKU_UID_CACHE="$u"; echo "$u"; return 0 ;;
         esac
+        shizuku_bridge_stop   # bridge up but not answering sanely — one clean restart
     done
     printf '\n' >&2
     return 1
@@ -1148,6 +1228,7 @@ shizuku_status() {
             2000) ok "Shizuku connected (running as shell, uid 2000)" ;;
             *)    ok "Shizuku connected (uid $u)" ;;
         esac
+        shizuku_bridge_alive && info "  persistent bridge holds the binder (pid $(cat "$SHIZUKU_DDIR/bridge.pid" 2>/dev/null)) — keeps working even if the Shizuku app is killed"
         return 0
     fi
     err "Shizuku unreachable from Termux (other apps may still work — they already hold a binder)."
@@ -1251,6 +1332,10 @@ studio_shizuku() {
                 err "couldn't start it — no adb device (enable Wireless debugging; 'studio adb pair' once)"
                 return 1
             fi ;;
+        restart|reconnect)
+            shizuku_bridge_stop; SHIZUKU_UID_CACHE=""
+            info "restarting the Shizuku bridge…"
+            shizuku_status ;;
         open|o)    local s; s="$(shizuku_cli)" || { err "shizuku CLI not found"; return 1; }; "$s" open ;;
         sync)      shizuku_sync_dex && ok "dex in sync with the installed Shizuku app" ;;
         install|inst)
@@ -1259,7 +1344,7 @@ studio_shizuku() {
             [ -f "$apk" ] || { err "no such APK: $apk"; return 1; }
             shizuku_status || return 1
             shizuku_install "$apk" ;;
-        *) err "usage: studio shizuku {status|start|open|sync|install <apk>}"; return 1 ;;
+        *) err "usage: studio shizuku {status|start|restart|open|sync|install <apk>}"; return 1 ;;
     esac
 }
 
@@ -1715,7 +1800,7 @@ usage() {
     echo -e "                 ${CYAN}--remember${NC} to a build/run — run keeps variant/launch/logcat,"
     echo -e "                 release builds keep keystore + APK name (shared with the TUI)"
     echo -e "  ${GREEN}adb${NC}  {pair|connect [port]|disconnect|status}   Wireless debugging (Android 11+, no root)"
-    echo -e "  ${GREEN}shizuku${NC} {status|open|sync|install <apk>}   Install via Shizuku (no adb pairing, no root)"
+    echo -e "  ${GREEN}shizuku${NC} {status|start|restart|open|sync|install <apk>}   Install via Shizuku (no adb pairing, no root)"
     echo -e "  ${GREEN}jdk${NC}  {list|install <ver>|use <ver> [project]|which}   Manage build JDKs (11/17/21)"
     echo -e "  ${GREEN}ndk${NC}  {list|install [ver]|use <ver> [project]|which|remove <ver>}   Manage the aarch64 NDK (native C/C++)"
     echo -e "  ${GREEN}logcat${NC} [pkg|path] [-- adb-logcat-args]   Stream the app's debug logs (needs adb)"

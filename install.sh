@@ -171,6 +171,7 @@ install -m 755 "$REPO/bin/wadb"   "$PREFIX/bin/wadb"
 mkdir -p "$HOME_DIR/.studio"
 install -m 755 "$REPO/scripts/studio_new.py"    "$HOME_DIR/.studio/studio_new.py"
 install -m 644 "$REPO/scripts/studio_compat.py" "$HOME_DIR/.studio/studio_compat.py"
+install -m 755 "$REPO/scripts/shizuku_bridge.py" "$HOME_DIR/.studio/shizuku_bridge.py"
 install -m 755 "$REPO/scripts/termux_studio.py" "$HOME_DIR/termux_studio.py"
 ok "studio installed ($PREFIX/bin/studio, $PREFIX/bin/wadb, ~/.studio, ~/termux_studio.py)"
 
