@@ -60,14 +60,16 @@ ensure_local_props() {
     fi
 }
 
+# Per-project key used by every out-of-repo store (stash, pins, prefs) — same scheme
+# the TUI uses for its keystore configs, so both tools address the same files.
+proj_key() { echo "$1" | sed 's#[/ ]#_#g'; }
+
 # Where the Studio daemon-JVM file is stashed during a Termux build. Kept OUTSIDE the
 # project so the repo (and its Android Studio config) is never modified.
 stash_path() {
     local proj="$1"
-    local key
-    key=$(echo "$proj" | sed 's#[/ ]#_#g')
     mkdir -p "$STUDIO_DIR/daemon-jvm-stash"
-    echo "$STUDIO_DIR/daemon-jvm-stash/$key.bak"
+    echo "$STUDIO_DIR/daemon-jvm-stash/$(proj_key "$proj").bak"
 }
 
 # Restore the Studio daemon-JVM file if a previous (e.g. interrupted) build left it stashed.
@@ -183,8 +185,7 @@ jdk_version() {
 }
 
 jdk_pin_file() {  # per-project JDK pin path (same key scheme as the daemon-JVM stash)
-    local key; key=$(echo "$1" | sed 's#[/ ]#_#g')
-    echo "$JDK_PIN_DIR/$key"
+    echo "$JDK_PIN_DIR/$(proj_key "$1")"
 }
 
 # Decide which JAVA_HOME a build should use:
@@ -558,6 +559,117 @@ studio_ndk() {
     esac
 }
 
+# ----------------------------------------------------------------- remembered choices
+#
+# Per-project memory for build/run choices, so a plain `studio run` repeats what you
+# picked last time you passed --remember (variant, launch, logcat) and release builds
+# reuse the saved signing config + APK name. Two stores, both out-of-repo:
+#   ~/.studio/prefs/<key>            run choices (plain key=value)
+#   ~/.studio/keystores/<key>.json   release signing — the SAME file the TUI's
+#                                    "remember release settings" writes, so CLI and TUI
+#                                    share one memory. Passwords plaintext, mode 600.
+
+PREFS_DIR="$STUDIO_DIR/prefs"
+KS_CFG_DIR="$STUDIO_DIR/keystores"
+
+run_prefs_file()   { echo "$PREFS_DIR/$(proj_key "$1")"; }
+release_cfg_file() { echo "$KS_CFG_DIR/$(proj_key "$1").json"; }
+
+# Fill PREF_VARIANT / PREF_LAUNCH / PREF_LOGCAT from the prefs file (callers declare them).
+load_run_prefs() {
+    local f; f="$(run_prefs_file "$1")"
+    [ -f "$f" ] || return 0
+    PREF_VARIANT="$(sed -n 's/^variant=//p' "$f")"
+    PREF_LAUNCH="$(sed -n 's/^launch=//p' "$f")"
+    PREF_LOGCAT="$(sed -n 's/^logcat=//p' "$f")"
+}
+
+save_run_prefs() {   # $1 proj, $2 variant, $3 launch(0/1), $4 logcat(0/1)
+    mkdir -p "$PREFS_DIR"
+    { echo "variant=$2"; echo "launch=$3"; echo "logcat=$4"; } > "$(run_prefs_file "$1")"
+}
+
+# Print the remembered release settings as shell-quoted RC_* assignments for eval.
+# Returns 1 when nothing is remembered (or the json is unreadable).
+read_release_cfg() {
+    local f; f="$(release_cfg_file "$1")"
+    [ -f "$f" ] || return 1
+    python3 - "$f" <<'PYEOF'
+import json, shlex, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+for jk, var in (("path", "RC_KS"), ("store_pass", "RC_SP"), ("alias", "RC_AL"),
+                ("key_pass", "RC_KP"), ("apk_name", "RC_NAME")):
+    print(f"{var}={shlex.quote(str(d.get(jk) or ''))}")
+PYEOF
+}
+
+# Persist release settings in the TUI's schema. An empty keystore path means "debug
+# keystore" (the TUI's convention). auto=true so the TUI also skips its prompts.
+save_release_cfg() {   # $1 proj, $2 ks_file(''=debug), $3 ks_pass, $4 alias, $5 key_pass, $6 apk_name
+    mkdir -p "$KS_CFG_DIR"
+    python3 - "$(release_cfg_file "$1")" "$2" "$3" "$4" "$5" "$6" <<'PYEOF'
+import json, os, sys
+f, ks, sp, al, kp, name = sys.argv[1:7]
+data = {"apk_name": name, "auto": True}
+if ks:
+    data.update({"path": ks, "store_pass": sp, "alias": al, "key_pass": kp})
+with open(f, "w") as fh:
+    json.dump(data, fh)
+os.chmod(f, 0o600)
+PYEOF
+}
+
+studio_remember() {
+    # studio remember [path]          show what's remembered for the project
+    # studio remember clear [path]    forget it all (run choices + release settings)
+    local sub="show"
+    case "${1:-}" in
+        clear|reset|forget) sub="clear"; shift ;;
+        show)               shift ;;
+    esac
+    local proj; proj="$(resolve_project "${1:-$PWD}")" || return 1
+    local pf rf; pf="$(run_prefs_file "$proj")"; rf="$(release_cfg_file "$proj")"
+
+    if [ "$sub" = "clear" ]; then
+        if [ -f "$pf" ] || [ -f "$rf" ]; then
+            rm -f "$pf" "$rf"
+            ok "cleared remembered choices for $(basename "$proj") (run + release settings)"
+        else
+            info "nothing remembered for $(basename "$proj")"
+        fi
+        return 0
+    fi
+
+    echo -e "${CYAN}===== REMEMBERED CHOICES: $(basename "$proj") =====${NC}"
+    if [ -f "$pf" ]; then
+        local PREF_VARIANT="" PREF_LAUNCH="" PREF_LOGCAT=""
+        load_run_prefs "$proj"
+        echo -e "  ${BOLD}run:${NC}     variant=${GREEN}${PREF_VARIANT:-debug}${NC}" \
+                "launch=${GREEN}$([ "${PREF_LAUNCH:-1}" = "1" ] && echo yes || echo no)${NC}" \
+                "logcat=${GREEN}$([ "${PREF_LOGCAT:-0}" = "1" ] && echo yes || echo no)${NC}"
+    else
+        echo -e "  ${BOLD}run:${NC}     nothing — save with: ${CYAN}studio run [flags] --remember${NC}"
+    fi
+    if [ -f "$rf" ]; then
+        local RC_KS="" RC_SP="" RC_AL="" RC_KP="" RC_NAME=""
+        eval "$(read_release_cfg "$proj")"
+        if [ -n "$RC_KS" ]; then
+            echo -e "  ${BOLD}release:${NC} keystore=${GREEN}$RC_KS${NC}  alias=${GREEN}$RC_AL${NC}  (passwords stored, not shown)"
+            [ -f "$RC_KS" ] || warn "  that keystore file no longer exists — the next release build falls back"
+        else
+            echo -e "  ${BOLD}release:${NC} sign with the ${GREEN}debug keystore${NC}"
+        fi
+        [ -n "$RC_NAME" ] && echo -e "           apk-name=${GREEN}$RC_NAME${NC}"
+        echo -e "           (shared with the TUI's 'remember release settings')"
+    else
+        echo -e "  ${BOLD}release:${NC} nothing — save with: ${CYAN}studio build assembleRelease [signing flags] --remember${NC}"
+    fi
+    echo -e "  Forget:  ${CYAN}studio remember clear ${proj}${NC}"
+}
+
 # ----------------------------------------------------------------- build
 
 studio_build() {
@@ -571,7 +683,7 @@ studio_build() {
     fi
     # Separate keystore/signing flags from the Gradle tasks. Everything that isn't a
     # signing flag is forwarded verbatim to Gradle.
-    local ks_file="" ks_pass="" ks_alias="" key_pass="" jdk_override="" apk_name="" want_lint=0
+    local ks_file="" ks_pass="" ks_alias="" key_pass="" jdk_override="" apk_name="" want_lint=0 remember=0
     while [ $# -gt 0 ]; do
         case "$1" in
             --keystore|--ks)        ks_file="$2"; shift 2 ;;
@@ -582,6 +694,7 @@ studio_build() {
             --apk-name|--release-name) apk_name="$2"; shift 2 ;;
             --lint)                 want_lint=1; shift ;;
             --no-lint)              want_lint=0; shift ;;
+            --remember)             remember=1; shift ;;
             *)                      tasks+=("$1"); shift ;;
         esac
     done
@@ -590,8 +703,26 @@ studio_build() {
     # For release builds, sign the APK via AGP's injected signing properties (the same
     # mechanism Android Studio uses) — no change to the project's build.gradle. Falls back
     # to the debug keystore when the user supplies none, so the release APK is installable.
-    local sign_props=()
+    local sign_props=() is_release=0 ks_source="debug"
     if printf '%s\n' "${tasks[@]}" | grep -qi 'release'; then
+        is_release=1
+        [ -n "$ks_file" ] && ks_source="flag"
+        # No signing flags? Reuse the remembered per-project release settings (the same
+        # store the TUI's "remember release settings" writes) before the debug fallback.
+        if [ -z "$ks_file" ]; then
+            local rc_out RC_KS="" RC_SP="" RC_AL="" RC_KP="" RC_NAME=""
+            if rc_out="$(read_release_cfg "$proj")"; then
+                eval "$rc_out"
+                if [ -n "$RC_KS" ] && [ -f "$RC_KS" ]; then
+                    ks_file="$RC_KS"; ks_pass="$RC_SP"; ks_alias="$RC_AL"; key_pass="${RC_KP:-$RC_SP}"
+                    ks_source="remembered"
+                    info "using remembered release settings ('studio remember' to view, 'studio remember clear' to forget)"
+                elif [ -n "$RC_KS" ]; then
+                    warn "remembered keystore no longer exists ($RC_KS) — ignoring it"
+                fi
+                [ -z "$apk_name" ] && [ -n "$RC_NAME" ] && apk_name="$RC_NAME"
+            fi
+        fi
         if [ -z "$ks_file" ]; then
             ks_file="$(ensure_debug_keystore)" || return 1
             ks_pass="android"; ks_alias="androiddebugkey"; key_pass="android"
@@ -621,6 +752,19 @@ studio_build() {
        && ! printf '%s\n' "${tasks[@]}" | grep -qi 'lint'; then
         perf_args+=("-x" "lintVitalRelease")
         info "skipping lintVitalRelease for speed (use --lint to keep the release lint scan)"
+    fi
+
+    # --remember: persist the release signing + APK name for this project so the next
+    # `studio build …Release` / TUI release build reuses them without any flags.
+    if [ "$remember" = "1" ]; then
+        if [ "$is_release" = "1" ]; then
+            local save_ks="$ks_file"
+            [ "$ks_source" = "debug" ] && save_ks=""   # TUI convention: no path = debug keystore
+            save_release_cfg "$proj" "$save_ks" "$ks_pass" "$ks_alias" "$key_pass" "$apk_name"
+            ok "remembered release settings for $(basename "$proj") (view: studio remember $proj)"
+        else
+            warn "--remember on a build only stores release settings — nothing saved for a debug task"
+        fi
     fi
 
     check_global_gradle
@@ -1105,8 +1249,11 @@ studio_logcat() {
 }
 
 studio_run() {
-    # studio run [path] [--release] [--no-launch] [--logcat] [--shizuku] [extra gradle tasks...]
-    local proj="" variant="debug" launch=1 tail_log=0 use_shizuku=0 extra=()
+    # studio run [path] [--release|--debug] [--no-launch|--launch] [--logcat|--no-logcat]
+    #            [--shizuku] [--remember] [extra gradle tasks...]
+    # Choices not given on the command line fall back to what --remember saved for the
+    # project (variant/launch/logcat), then to the usual defaults (debug/launch/no logcat).
+    local proj="" variant="" launch="" tail_log="" use_shizuku=0 remember=0 extra=()
     local first="${1:-}"
     if [ -n "$first" ] && [ -d "$first" ]; then proj="$first"; shift; fi
     while [ $# -gt 0 ]; do
@@ -1114,17 +1261,38 @@ studio_run() {
             --release)   variant="release" ;;
             --debug)     variant="debug" ;;
             --no-launch) launch=0 ;;
+            --launch)    launch=1 ;;
             --logcat|--log) tail_log=1 ;;
             --shizuku|--rish) use_shizuku=1 ;;
+            --no-logcat)    tail_log=0 ;;
+            --remember)  remember=1 ;;
             *)           extra+=("$1") ;;
         esac
         shift
     done
     proj="$(resolve_project "${proj:-$PWD}")" || return 1
 
+    local PREF_VARIANT="" PREF_LAUNCH="" PREF_LOGCAT=""
+    load_run_prefs "$proj"
+    if [ -z "$variant" ] && [ -n "$PREF_VARIANT" ]; then
+        variant="$PREF_VARIANT"
+        info "using remembered run choices: $variant ('studio remember' to view/clear)"
+    fi
+    variant="${variant:-debug}"
+    launch="${launch:-${PREF_LAUNCH:-1}}"
+    tail_log="${tail_log:-${PREF_LOGCAT:-0}}"
+
+    if [ "$remember" = "1" ]; then
+        save_run_prefs "$proj" "$variant" "$launch" "$tail_log"
+        ok "remembered run choices for $(basename "$proj"): variant=$variant launch=$launch logcat=$tail_log"
+    fi
+
     # 1) Assemble. Capitalise the variant for the Gradle task (assembleDebug/assembleRelease).
     local cap="$(tr '[:lower:]' '[:upper:]' <<<"${variant:0:1}")${variant:1}"
-    studio_build "$proj" ":app:assemble${cap}" "${extra[@]}" || return 1
+    # Forward --remember to the build for release runs so signing flags get saved too.
+    local bflags=()
+    [ "$remember" = "1" ] && [ "$variant" = "release" ] && bflags=(--remember)
+    studio_build "$proj" ":app:assemble${cap}" "${bflags[@]}" "${extra[@]}" || return 1
 
     # 2) Locate the freshest *installable* APK for this variant. Prefer a signed APK and
     #    skip any leftover *-unsigned.apk — the package installer rejects unsigned APKs,
@@ -1485,6 +1653,9 @@ usage() {
     echo -e "                 Release lint: skipped for speed by default; ${CYAN}--lint${NC} keeps the lintVitalRelease scan"
     echo -e "                 (release builds with no keystore are signed with the debug keystore)"
     echo -e "  ${GREEN}run${NC}  [path] [--release] [--no-launch] [--logcat] [--shizuku] [signing flags]   Build, install & launch (like AS ▶)"
+    echo -e "  ${GREEN}remember${NC} [clear] [path]   Show/forget remembered choices; save them by adding"
+    echo -e "                 ${CYAN}--remember${NC} to a build/run — run keeps variant/launch/logcat,"
+    echo -e "                 release builds keep keystore + APK name (shared with the TUI)"
     echo -e "  ${GREEN}adb${NC}  {pair|connect [port]|disconnect|status}   Wireless debugging (Android 11+, no root)"
     echo -e "  ${GREEN}shizuku${NC} {status|open|sync|install <apk>}   Install via Shizuku (no adb pairing, no root)"
     echo -e "  ${GREEN}jdk${NC}  {list|install <ver>|use <ver> [project]|which}   Manage build JDKs (11/17/21)"
@@ -1509,6 +1680,9 @@ usage() {
     echo -e "  studio run ~/projects/MyApp --logcat   # …and stream its logs (needs wireless adb)"
     echo -e "  studio run ~/projects/MyApp --shizuku  # install via Shizuku (no adb pairing, no root)"
     echo -e "  studio run ~/projects/MyApp --shizuku --no-launch   # headless build+install for agents/CI"
+    echo -e "  studio run ~/projects/MyApp --release --remember   # next bare 'studio run' repeats this"
+    echo -e "  studio build ~/projects/MyApp assembleRelease --keystore ~/my.jks --ks-pass pw \\\\"
+    echo -e "               --ks-alias key --remember   # future release builds sign without flags"
     echo -e "  studio gradle ~/projects/MyApp testDebugUnitTest    # run unit tests (Termux toolchain)"
     echo -e "  studio gradle ~/projects/MyApp :app:lintDebug       # lint a module"
     echo -e "  studio ndk install                  # one-time aarch64 NDK + CMake setup (native C/C++)"
@@ -1535,6 +1709,7 @@ case "$cmd" in
     jdk|java)     studio_jdk "$@" ;;
     ndk)          studio_ndk "$@" ;;
     logcat|log)   studio_logcat "$@" ;;
+    remember|prefs) studio_remember "$@" ;;
     git)          studio_git "$@" ;;
     push)         studio_git "$@" push ;;
     start)        [ -f "$STUDIO_PY" ] && python3 "$STUDIO_PY" "$@" || err "TUI not found at $STUDIO_PY" ;;
