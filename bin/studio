@@ -1077,32 +1077,52 @@ shizuku_exec() {
     timeout "$t" "$s" exec "$cmd" 2>&1
 }
 
+# Start the Shizuku *server* over (wireless) adb — the official non-root way, and the ONLY
+# remedy when it was never started this boot (thaw broadcasts revive the frozen manager app,
+# not a dead server). Tries the app's exported start.sh, then derives the starter binary from
+# the installed APK (covers devices where start.sh was never exported). Needs adb; returns 1
+# fast when no device is reachable. Success = the starter reports exit 0.
+shizuku_start_server() {
+    adb_device_ready || adb_connect >/dev/null 2>&1 || return 1
+    adb_device_ready || return 1
+    printf ' (starting the Shizuku server via adb)' >&2
+    shizuku_unfreeze
+    local out
+    out="$(timeout 30 adb shell 'sh /storage/emulated/0/Android/data/moe.shizuku.privileged.api/files/start.sh 2>/dev/null \
+        || { apk=$(pm path moe.shizuku.privileged.api | sed -n "s/^package://p" | head -1); \
+             lib=${apk%/*}/lib/arm64/libshizuku.so; [ -f "$lib" ] && "$lib"; }' 2>&1)"
+    echo "$out" | grep -q "exit with 0"
+}
+
 # Probe Shizuku, echoing the uid it runs as (2000 = shell, 0 = root). Cached per-process.
 # We THAW the Shizuku app first (broadcast — wakes the MIUI-killed manager process, no GUI), so
-# the very first rish call usually answers in ~2s. Print a dot per attempt so the run never looks
-# frozen. On a "Request timeout" we thaw again and retry; a dex mismatch (UnsatisfiedLinkError/
-# librish — the only thing the slow APK-pull repair fixes) is repaired only then. Bounded worst
-# case (~30+20+20s) and it always prints progress.
+# the first rish call usually answers in ~2s; one thaw-retry covers a slow wake. rish itself
+# gives up after ~7s ("Request timeout", exit 0!) so long timeout windows only waste time:
+# after TWO quick misses the server is simply not running, and no retry can fix that — we
+# either start it ourselves over adb (self-heal) or fail fast. A dex mismatch
+# (UnsatisfiedLinkError/librish — the only thing the slow APK-pull repair fixes) is repaired
+# only when seen. Fail path without adb ≈ 18s; happy path ~2s; always prints progress.
 SHIZUKU_UID_CACHE=""
 shizuku_probe() {
     [ -n "$SHIZUKU_UID_CACHE" ] && { echo "$SHIZUKU_UID_CACHE"; return 0; }
     local s; s="$(shizuku_cli)" || return 1
     shizuku_unfreeze
     shizuku_thaw; sleep 1
-    local u out i t
+    local u out i
     for i in 1 2 3; do
-        t=$([ "$i" = 1 ] && echo 30 || echo 20)
         printf '.' >&2
-        out="$(timeout "$t" "$s" exec 'id -u' 2>&1 | tr -d '\r')"
+        out="$(timeout 12 "$s" exec 'id -u' 2>&1 | tr -d '\r')"
         u="$(printf '%s' "$out" | tail -n1)"
         case "$u" in [0-9]*) printf '\n' >&2; SHIZUKU_UID_CACHE="$u"; echo "$u"; return 0 ;; esac
         if echo "$out" | grep -qiE "UnsatisfiedLinkError|librish"; then
             printf ' (dex mismatch — repairing)' >&2; shizuku_sync_dex; continue
         fi
-        if echo "$out" | grep -qiE "Request timeout|may be blocked"; then
-            printf ' (waking Shizuku)' >&2; shizuku_thaw; sleep 2; continue
-        fi
-        [ "$i" -lt 3 ] && sleep 2
+        case "$i" in
+            1) printf ' (waking Shizuku)' >&2; shizuku_thaw; sleep 2 ;;
+            2) # Two quick misses -> the server isn't running. Self-heal via adb or stop NOW.
+               shizuku_start_server || { printf '\n' >&2; return 1; }
+               sleep 2 ;;
+        esac
     done
     printf '\n' >&2
     return 1
@@ -1120,7 +1140,7 @@ shizuku_status() {
         echo -e "     Shizuku app tap ${BOLD}'Use Shizuku in terminal apps'${NC} once."
         return 1
     fi
-    printf '%b' "${CYAN}ℹ connecting to Shizuku${NC} (first call after a build can take ~30s)"
+    printf '%b' "${CYAN}ℹ connecting to Shizuku${NC}"
     local u; u="$(shizuku_probe)"
     if [ -n "$u" ]; then
         case "$u" in
@@ -1130,9 +1150,10 @@ shizuku_status() {
         esac
         return 0
     fi
-    err "Shizuku not reachable — open the Shizuku app and make sure the service is started"
-    echo -e "     (start it once per boot via wireless-adb or root), then grant terminal access."
-    echo -e "     If it keeps timing out, disable battery optimisation for Shizuku + Termux."
+    err "Shizuku server is not running (it must be started once per boot)."
+    echo -e "     Fix: enable ${BOLD}Wireless debugging${NC} (Developer options), then: ${BOLD}studio shizuku start${NC}"
+    echo -e "     (auto-starts the server via adb — 'studio adb pair' once if never paired);"
+    echo -e "     or start it from the Shizuku app itself."
     return 1
 }
 
@@ -1147,6 +1168,15 @@ shizuku_status() {
 # adb). Never report success off the exit code alone.
 shizuku_install() {   # $1 apk, $2 pkg
     local apk="$1" pkg="${2:-}" s; s="$(shizuku_cli)" || { err "shizuku CLI not found"; return 1; }
+    # Fail before staging when the selected file is an intermediate, unsigned APK. Android's
+    # package manager otherwise reports INSTALL_PARSE_FAILED_NO_CERTIFICATES after the bridge
+    # has done its job, which misleadingly looks like a Shizuku transport failure.
+    if command -v apksigner >/dev/null 2>&1 && ! apksigner verify "$apk" >/dev/null 2>&1; then
+        err "APK is not signed and Android cannot install it: $apk"
+        echo -e "     Install the final signed APK (not an ${BOLD}-unsigned${NC} or ${BOLD}-aligned${NC} intermediate)." >&2
+        echo -e "     Studio-built release APKs are signed automatically; custom APKs must be signed first." >&2
+        return 1
+    fi
     if [ -z "$pkg" ]; then
         local a2; a2="$(aapt2_bin)"
         [ -n "$a2" ] && pkg="$("$a2" dump badging "$apk" 2>/dev/null \
@@ -1157,6 +1187,9 @@ shizuku_install() {   # $1 apk, $2 pkg
     # on Android 13+ the installer can't pull an fd from FUSE /storage and returns 255 with no
     # output. The reliable route (what `adb install` does) is: have the Shizuku shell copy the
     # APK into /data/local/tmp (which uid 2000 owns) and install from there.
+    local was_installed=0
+    [ -n "$pkg" ] && timeout 25 "$s" exec "pm path $pkg" 2>/dev/null | grep -qi "^package:" \
+        && was_installed=1
     local staged; staged="$(ensure_installable_apk "$apk")"
     local rtmp="/data/local/tmp/studio-install-$$.apk"
     local remote="cp '$staged' '$rtmp' && pm install -r -d -t '$rtmp'; __r=\$?; rm -f '$rtmp'; exit \$__r"
@@ -1175,11 +1208,21 @@ shizuku_install() {   # $1 apk, $2 pkg
     done
     # Positive verification — pm said Success, OR the package now resolves through Shizuku.
     if echo "$out" | grep -qi "Success" \
-       || { [ -n "$pkg" ] && timeout 25 "$s" exec "pm path $pkg" 2>/dev/null | grep -qi "^package:"; }; then
+       || { [ "$was_installed" = "0" ] && [ -n "$pkg" ] \
+            && timeout 25 "$s" exec "pm path $pkg" 2>/dev/null | grep -qi "^package:"; }; then
         ok "installed via Shizuku${pkg:+ ($pkg)}"
         return 0
     fi
-    err "Shizuku install failed (exit $rc):"; echo "${out:-<no output from pm>}" >&2
+    err "Android package install failed through Shizuku (exit $rc):"; echo "${out:-<no output from pm>}" >&2
+    if echo "$out" | grep -qi "INSTALL_FAILED_UPDATE_INCOMPATIBLE"; then
+        echo -e "     The installed app was signed with a different key. Build/sign with that same key," >&2
+        echo -e "     or uninstall the existing app first (uninstalling removes its app data)." >&2
+        return 1
+    fi
+    if echo "$out" | grep -qi "INSTALL_PARSE_FAILED_NO_CERTIFICATES"; then
+        echo -e "     This APK is unsigned. Install the final signed APK, not an unsigned/aligned intermediate." >&2
+        return 1
+    fi
     [ -n "$pkg" ] || warn "could not derive package name to verify — pass it as 2nd arg."
     echo -e "     If this is a timeout, Shizuku was briefly blocked; re-run, or use MT Manager once" >&2
     echo -e "     to confirm Shizuku is granted, then retry." >&2
@@ -1197,6 +1240,15 @@ studio_shizuku() {
     local sub="${1:-status}"; shift 2>/dev/null
     case "$sub" in
         status|state|s|connect|c|info|i) shizuku_status ;;
+        start)
+            info "starting the Shizuku server via adb…"
+            if shizuku_start_server; then
+                echo >&2; SHIZUKU_UID_CACHE=""; sleep 1; shizuku_status
+            else
+                echo >&2
+                err "couldn't start it — no adb device (enable Wireless debugging; 'studio adb pair' once)"
+                return 1
+            fi ;;
         open|o)    local s; s="$(shizuku_cli)" || { err "shizuku CLI not found"; return 1; }; "$s" open ;;
         sync)      shizuku_sync_dex && ok "dex in sync with the installed Shizuku app" ;;
         install|inst)
@@ -1205,7 +1257,7 @@ studio_shizuku() {
             [ -f "$apk" ] || { err "no such APK: $apk"; return 1; }
             shizuku_status || return 1
             shizuku_install "$apk" ;;
-        *) err "usage: studio shizuku {status|open|sync|install <apk>}"; return 1 ;;
+        *) err "usage: studio shizuku {status|start|open|sync|install <apk>}"; return 1 ;;
     esac
 }
 
@@ -1335,17 +1387,21 @@ studio_run() {
     # 4) Install — Shizuku (rish) when asked; else prefer adb (true Studio-style flow, real
     #    exit codes) when a device is attached; otherwise hand the APK to the package installer.
     if [ "$use_shizuku" = "1" ]; then
-        shizuku_status || return 1
-        shizuku_install "$apk" "$pkg" || return 1
-        if [ "$launch" = "1" ] && [ -n "$pkg" ]; then
-            info "Launching $pkg…"
-            if shizuku_launch "$pkg" "$act"; then ok "launched $pkg"
-            else warn "could not auto-launch — open ${BOLD}$pkg${NC}${YELLOW} from your app drawer."; fi
+        if shizuku_status; then
+            shizuku_install "$apk" "$pkg" || return 1
+            if [ "$launch" = "1" ] && [ -n "$pkg" ]; then
+                info "Launching $pkg…"
+                if shizuku_launch "$pkg" "$act"; then ok "launched $pkg"
+                else warn "could not auto-launch — open ${BOLD}$pkg${NC}${YELLOW} from your app drawer."; fi
+            fi
+            if [ "$tail_log" = "1" ] && [ -n "$pkg" ]; then
+                warn "logcat needs adb — run 'studio adb pair' once, then 'studio logcat $pkg'."
+            fi
+            return 0
         fi
-        if [ "$tail_log" = "1" ] && [ -n "$pkg" ]; then
-            warn "logcat needs adb — run 'studio adb pair' once, then 'studio logcat $pkg'."
-        fi
-        return 0
+        # Shizuku down and not self-healable — still get the APK onto the device instead of
+        # aborting the whole run: fall through to the adb / package-installer flow.
+        warn "continuing without Shizuku (falling back to the standard install flow)…"
     fi
     if adb_device_ready; then
         info "Installing via adb…"
