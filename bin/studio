@@ -1150,10 +1150,12 @@ shizuku_status() {
         esac
         return 0
     fi
-    err "Shizuku server is not running (it must be started once per boot)."
-    echo -e "     Fix: enable ${BOLD}Wireless debugging${NC} (Developer options), then: ${BOLD}studio shizuku start${NC}"
-    echo -e "     (auto-starts the server via adb — 'studio adb pair' once if never paired);"
-    echo -e "     or start it from the Shizuku app itself."
+    err "Shizuku unreachable from Termux (other apps may still work — they already hold a binder)."
+    echo -e "     Two possible causes:"
+    echo -e "     • the system froze the Shizuku app → just retry (studio wakes it); if it keeps"
+    echo -e "       happening, disable battery optimisation for ${BOLD}Shizuku + Termux${NC};"
+    echo -e "     • its server isn't running (dies on reboot) → ${BOLD}studio shizuku start${NC} (needs"
+    echo -e "       Wireless debugging; 'studio adb pair' once), or start it in the Shizuku app."
     return 1
 }
 
