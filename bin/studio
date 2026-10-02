@@ -28,11 +28,20 @@ LAST_PKG_FILE="$STUDIO_DIR/last_pkg"           # package of the last 'studio run
 NDK_ROOT="$SDK_DIR/ndk"                         # side-by-side NDKs (AGP auto-discovers these)
 NDK_PIN_DIR="$STUDIO_DIR/ndk"                   # per-project NDK pins (out of repo)
 NDK_DEFAULT_FILE="$STUDIO_DIR/ndk-default"      # global default NDK dir
-# aarch64-native NDK repackaged to run on Termux. Google's official NDK ships an x86_64 Linux
-# host toolchain that cannot run on this device (same problem the bundled aapt2 had); this
-# build (lzhiyong/termux-ndk) runs natively on aarch64. Only this asset works here.
-NDK_AARCH64_URL="https://github.com/lzhiyong/termux-ndk/releases/download/android-ndk/android-ndk-r29-aarch64.7z"
-NDK_AARCH64_LABEL="r29"
+# aarch64-native NDKs that run on Termux. Google's official NDK ships an x86_64 Linux host
+# toolchain that cannot run on this device (same problem the bundled aapt2 had). Primary
+# source: HomuHomu833/android-ndk-custom "*-aarch64-linux-android" builds (bionic, ~120-190 MB
+# tar.xz, ship a linux-x86_64 -> linux-arm64 symlink so AGP finds the toolchain). Fallback for
+# r29: lzhiyong/termux-ndk (343 MB; its old .7z asset was replaced by .tar.xz on 2026-01-08).
+# Format: "<label> <url> [fallback-url]". First entry = default.
+NDK_HOMU="https://github.com/HomuHomu833/android-ndk-custom/releases/download"
+NDK_CATALOG=(
+    "r29  $NDK_HOMU/r29/android-ndk-r29-aarch64-linux-android.tar.xz https://github.com/lzhiyong/termux-ndk/releases/download/android-ndk/android-ndk-r29-aarch64.tar.xz"
+    "r28c $NDK_HOMU/r28/android-ndk-r28c-aarch64-linux-android.tar.xz"
+    "r27d $NDK_HOMU/r27/android-ndk-r27d-aarch64-linux-android.tar.xz"
+    "r26d $NDK_HOMU/r26/android-ndk-r26d-aarch64-linux-android.tar.xz"
+)
+NDK_AARCH64_LABEL="r29 r28c r27d r26d"
 
 info()  { echo -e "${CYAN}$*${NC}"; }
 ok()    { echo -e "${GREEN}✔ $*${NC}"; }
@@ -204,6 +213,84 @@ resolve_build_jdk() {
     return 0   # empty -> use whatever ~/.gradle/gradle.properties pins
 }
 
+# Byte-stream filter for gradle output: passes everything through IMMEDIATELY (the rich
+# console redraws its status line without newlines, so a line-buffered filter like sed would
+# freeze the live progress) and drops only the 4-line "Unable to set daemon's environment
+# variables" false warning. Text is held back only while it could still be that warning.
+gradle_output_filter() {
+    perl -CO -MEncode -e '
+        $| = 1; binmode STDIN;
+        my $W = $ENV{STUDIO_COLS} || 0;   # 0 = unknown/wide: leave status rows alone
+        my @w = ("Warning: Unable to set daemon\x27s environment variables to match the client because:",
+                 "  There is no native integration with this operating environment.",
+                 "  If the daemon was started with a significantly different environment from the client, and your build",
+                 "  relies on environment variables, you may experience unexpected behavior.");
+        my %drop = map { $_ => 1 } @w;
+        my $esc = qr/\e\[[0-9;?]*[A-Za-z]/;
+        # Gradle cannot query the terminal width on Android and draws its live status rows for
+        # 80 columns; on a narrower Termux screen they wrap and the in-place redraw piles up.
+        # A status row is "<text>ESC[nD" (cursor back over what it just wrote) - trim those
+        # rows to the real width and fix n. Log lines end in \n and are never trimmed.
+        sub fit {
+            my ($row, $n) = @_;
+            my @tok = $row =~ /(\e\[[0-9;?]*[A-Za-z]|.)/gs;
+            my @vis = grep { !/^\e/ } @tok;
+            return "$row\e[${n}D" if @vis <= $W - 1;
+            my ($lead, $trail) = ("", "");
+            $lead .= shift @tok while @tok && $tok[0] =~ /^\e/;
+            $trail = pop(@tok) . $trail while @tok && $tok[-1] =~ /^\e/;
+            my $text = join "", @vis;
+            # "> parent > child > file > 62 KiB/686 KiB": the end is what matters -> keep the
+            # tail. Anything else (the progress bar) keeps its start.
+            $text = $text =~ /^>/ ? "> \x{2026}" . substr($text, -($W - 4))
+                                  : substr($text, 0, $W - 1);
+            return $lead . $text . $trail . "\e[" . length($text) . "D";
+        }
+        sub emit {
+            my $t = shift;
+            $t =~ s/((?:\A|\n|\e\[\d*[AB]))((?:\e\[[0-9;?]*[mK]|[^\e\n])*)\e\[(\d+)D/$1 . fit($2, $3)/ge
+                if $W && $W < 80;
+            # a log line wider than the screen wraps onto rows Gradle still thinks hold status
+            # text; clear to end-of-line before each newline so no stale status shows through
+            $t =~ s/(?<!\e\[0K)\n/\e[0K\n/g if $W && $W < 80;
+            print $t;
+        }
+        my ($raw, $p) = ("", "");
+        while (sysread(STDIN, my $buf, 65536)) {
+            $raw .= $buf;
+            $p .= decode("UTF-8", $raw, Encode::FB_QUIET);   # keeps a split UTF-8 tail in $raw
+            my $out = "";
+            while ((my $i = index($p, "\n")) >= 0) {
+                my $line = substr($p, 0, $i + 1, "");
+                (my $t = $line) =~ s/$esc//g; $t =~ s/\s+\z//;
+                if ($drop{$t}) {               # keep its cursor moves so the layout stays right
+                    $out .= $1 if $line =~ /\A((?:$esc)*)/;
+                } else { $out .= $line }
+            }
+            if ($p ne "") {
+                (my $t = $p) =~ s/$esc//g;
+                my $partial = ($t =~ s/\e(?:\[[0-9;?]*)?\z//);   # escape split across reads
+                my $hold = $partial;
+                for my $x (@w) { if ($t ne "" && index($x, $t) == 0) { $hold = 1; last } }
+                unless ($hold) { $out .= $p; $p = ""; }
+            }
+            emit($out) if $out ne "";
+        }
+        emit($p . decode("UTF-8", $raw));
+    '
+}
+
+# The JAVA_HOME the build daemon would use when no explicit JDK was picked.
+gradle_java_home() {
+    local proj="$1" f v
+    for f in "$HOME/.gradle/gradle.properties" "$proj/gradle.properties"; do
+        [ -f "$f" ] || continue
+        v="$(sed -n 's/^[[:space:]]*org\.gradle\.java\.home[[:space:]]*[=:][[:space:]]*//p' "$f" | tail -n1)"
+        [ -n "$v" ] && [ -x "$v/bin/java" ] && { echo "$v"; return 0; }
+    done
+    echo "${JAVA_HOME:-$JAVA_HOME_DEFAULT}"
+}
+
 jdk_list() {
     echo -e "${CYAN}===== INSTALLED JDKs =====${NC}"
     local def; def="$(grep -h org.gradle.java.home ~/.gradle/gradle.properties 2>/dev/null | cut -d= -f2)"
@@ -300,7 +387,7 @@ studio_jdk() {
 #
 # Native (C/C++) Android builds need an NDK + CMake. Google's official NDK ships an x86_64
 # Linux host toolchain that CANNOT run on this aarch64 device — exactly the problem the
-# bundled aapt2 had. We instead install an aarch64-native NDK (lzhiyong/termux-ndk) under
+# bundled aapt2 had. We instead install an aarch64-native NDK (see NDK_CATALOG) under
 # $SDK/ndk/<revision> so AGP discovers it side-by-side, and point AGP's CMake at Termux's own
 # cmake/ninja via cmake.dir. None of this touches the repo: ndk.dir/cmake.dir go in the
 # git-ignored local.properties, and per-project NDK pins live out-of-repo (like the JDK pins).
@@ -428,10 +515,10 @@ ndk_list() {
     echo -e "  Ninja: ${CYAN}$(command -v ninja || echo 'not found')${NC}"
     echo
     echo -e "Installable (aarch64-native, runs on Termux): ${GREEN}${NDK_AARCH64_LABEL}${NC}"
-    echo -e "  ${BOLD}studio ndk install${NC}   (downloads ~340 MB from lzhiyong/termux-ndk)"
+    echo -e "  ${BOLD}studio ndk install [r29|r28|r27|r26]${NC}   (~120-190 MB each, default r29)"
 }
 
-# Make the toolchain binaries executable — 7z extraction can drop the exec bit. Covers both
+# Make the toolchain binaries executable — some repackaged archives drop the exec bit. Covers both
 # the CMake/clang toolchain AND the ndk-build (Android.mk) path: the top-level ndk-build/
 # ndk-* wrappers, the make-based scripts under build/, and the bundled prebuilt make/awk live
 # OUTSIDE any bin/ dir, so chmod them explicitly or ndk-build fails with "Permission denied".
@@ -456,6 +543,7 @@ ndk_fix_perms() {
 ndk_fix_shebangs() {
     local dest="$1" bash_p py_p f n=0
     bash_p="$(command -v bash)"; py_p="$(command -v python3 || command -v python)"
+    local perl_p; perl_p="$(command -v perl)"
     [ -n "$bash_p" ] || { warn "bash not found — cannot fix ndk-build shebangs"; return 0; }
     info "Fixing NDK script shebangs for Termux (ndk-build/Android.mk needs this)…"
     while IFS= read -r f; do
@@ -465,33 +553,50 @@ ndk_fix_shebangs() {
           -e "1s|^#!\s*/usr/bin/env\s+sh\b|#!$bash_p|" \
           -e "1s|^#!\s*/usr/bin/env\s+python[0-9.]*|#!${py_p:-$bash_p}|" \
           -e "1s|^#!\s*/usr/bin/python[0-9.]*|#!${py_p:-$bash_p}|" \
+          ${perl_p:+-e "1s|^#!\s*/usr/bin/env\s+perl|#!$perl_p|"} \
           "$f" 2>/dev/null && n=$((n+1))
     done < <(grep -rIlE '^#!\s*(/usr/bin/env|/bin/bash|/usr/bin/python)' "$dest" 2>/dev/null)
     ok "patched shebangs in $n NDK script(s) for ndk-build"
 }
 
+# Map a selector (r29, 29, 29.0.x, r28c, 28, latest, "") to a catalog line.
+ndk_catalog_entry() {
+    local sel="${1:-}" e label maj
+    case "$sel" in ""|latest) echo "${NDK_CATALOG[0]}"; return 0 ;; esac
+    sel="${sel#r}"; maj="${sel%%[!0-9]*}"
+    for e in "${NDK_CATALOG[@]}"; do
+        label="${e%% *}"; label="${label#r}"
+        [ "${label%%[!0-9]*}" = "$maj" ] && { echo "$e"; return 0; }
+    done
+    return 1
+}
+
 ndk_install() {
-    local sel="${1:-}"
-    case "$sel" in
-        ""|r29|29|29.*|latest) : ;;
-        *) warn "only the aarch64-native ${NDK_AARCH64_LABEL} build is available for Termux; installing that." ;;
-    esac
-    local existing; existing="$(ndk_resolve "${sel:-29}" 2>/dev/null)"
+    local sel="${1:-}" entry
+    entry="$(ndk_catalog_entry "$sel")" || {
+        err "no aarch64 NDK for '$sel' — available: ${NDK_AARCH64_LABEL}"; return 1; }
+    local label url fallback maj
+    read -r label url fallback <<< "$entry"
+    maj="${label#r}"; maj="${maj%%[!0-9]*}"
+    local existing; existing="$(ndk_resolve "$maj" 2>/dev/null)"
     if [ -n "$existing" ]; then ok "NDK already installed: $(ndk_revision "$existing") ($existing)"; return 0; fi
 
-    command -v 7z >/dev/null 2>&1 || { info "Installing p7zip (to extract the NDK)…"; pkg install -y p7zip || { err "pkg install p7zip failed"; return 1; }; }
+    command -v xz >/dev/null 2>&1 || { info "Installing xz-utils (to extract the NDK)…"; pkg install -y xz-utils || { err "pkg install xz-utils failed"; return 1; }; }
     command -v cmake >/dev/null 2>&1 || { info "Installing cmake…"; pkg install -y cmake || warn "cmake install failed — native builds need it"; }
     command -v ninja >/dev/null 2>&1 || { info "Installing ninja…"; pkg install -y ninja || warn "ninja install failed — CMake builds need it"; }
 
     mkdir -p "$NDK_ROOT" "$STUDIO_DIR"
     local tmp; tmp="$(mktemp -d "$STUDIO_DIR/ndk-dl.XXXXXX")" || { err "mktemp failed"; return 1; }
-    local arc="$tmp/ndk.7z"
-    info "Downloading aarch64 NDK ${NDK_AARCH64_LABEL} (~340 MB)…"
-    if ! curl -fL --progress-bar "$NDK_AARCH64_URL" -o "$arc"; then
-        err "download failed"; rm -rf "$tmp"; return 1
-    fi
-    info "Extracting (this takes a minute)…"
-    if ! 7z x -y -o"$tmp" "$arc" >/dev/null; then
+    local arc="$tmp/ndk.tar.xz" u ok_dl=0
+    for u in "$url" $fallback; do
+        info "Downloading aarch64 NDK $label from ${u#https://github.com/}…"
+        curl -fL --progress-bar "$u" -o "$arc" && { ok_dl=1; break; }
+        warn "download failed from that source"
+    done
+    [ "$ok_dl" = 1 ] || { err "download failed"; rm -rf "$tmp"; return 1; }
+    info "Extracting…"
+    # multithreaded xz when available (all cores); plain tar -xJf otherwise
+    if ! { xz -T0 -dc "$arc" 2>/dev/null | tar -x -C "$tmp"; } && ! tar -xJf "$arc" -C "$tmp"; then
         err "extraction failed"; rm -rf "$tmp"; return 1
     fi
     rm -f "$arc"
@@ -502,9 +607,15 @@ ndk_install() {
     rm -rf "$dest"
     mv "$src" "$dest" || { err "could not move NDK into place"; rm -rf "$tmp"; return 1; }
     rm -rf "$tmp"
+    # AGP + android.toolchain.cmake look for the linux-x86_64 host dir; alias it if missing.
+    local pb="$dest/toolchains/llvm/prebuilt"
+    if [ ! -e "$pb/linux-x86_64" ]; then
+        local real; real="$(ls -d "$pb"/linux-* 2>/dev/null | head -n1)"
+        [ -n "$real" ] && ln -s "$(basename "$real")" "$pb/linux-x86_64"
+    fi
     ndk_fix_perms "$dest"
     ndk_fix_shebangs "$dest"
-    echo "$dest" > "$NDK_DEFAULT_FILE"
+    [ -f "$NDK_DEFAULT_FILE" ] || echo "$dest" > "$NDK_DEFAULT_FILE"
     ok "NDK $rev installed at $dest"
     echo -e "Native projects now build automatically — both ${BOLD}CMake${NC} (cmake.dir → Termux cmake)"
     echo -e "and ${BOLD}ndk-build${NC} (Android.mk, via the NDK's own make) are wired up at build time."
@@ -781,7 +892,9 @@ studio_build() {
     # AGP bump, dropped buildTools pin) so the repo always ends a build pristine.
     _restore() {
         if [ "$moved" = "1" ] && [ -f "$bak" ]; then mkdir -p "$proj/gradle"; mv -f "$bak" "$djvm"; fi
-        [ -f "$COMPAT_PY" ] && python3 "$COMPAT_PY" "$proj" --restore >/dev/null 2>&1 || true
+        # only spawn python when some compat patch is actually stashed (saves ~0.25 s/build)
+        [ -f "$COMPAT_PY" ] && [ -n "$(ls -A "$STUDIO_DIR/compat-stash" 2>/dev/null)" ] \
+            && python3 "$COMPAT_PY" "$proj" --restore >/dev/null 2>&1 || true
     }
     trap _restore EXIT INT TERM
     if [ -f "$djvm" ]; then
@@ -816,14 +929,38 @@ studio_build() {
         jdk_props=("-Dorg.gradle.java.home=$jdk_home")
         jdk_env=("JAVA_HOME=$jdk_home")
         info "Using JDK $(jdk_version "$jdk_home") ($jdk_home)"
+    else
+        jdk_env=("JAVA_HOME=$(gradle_java_home "$proj")")
     fi
+    # Persistent, warm Gradle daemon (reused across builds, exits after the idle timeout or
+    # `studio stop`). It runs with a FIXED whitelisted environment: Gradle can't re-apply the
+    # client env inside a running daemon on Android ("no native integration"), so the env must
+    # be identical every build. Extra vars a build needs: STUDIO_ENV_PASS="VAR1 VAR2".
+    local build_env=() v
+    for v in HOME PATH PREFIX TMPDIR LANG LD_PRELOAD TERMUX_VERSION \
+             ANDROID_ROOT ANDROID_DATA ANDROID_ART_ROOT ANDROID_I18N_ROOT ANDROID_TZDATA_ROOT \
+             EXTERNAL_STORAGE $STUDIO_ENV_PASS; do
+        [ -n "${!v+x}" ] && build_env+=("$v=${!v}")
+    done
 
     info "Building ${BOLD}${tasks[*]}${NC}${CYAN} in $proj"
     [ "$gradle_bin" != "gradle" ] && info "  (using $gradle_bin)"
     echo
+    # Live status: Gradle's rich console shows the progress bar, "Resolve dependencies…",
+    # downloads and running tasks during the long configure/download phase that the plain
+    # console leaves blank. Rich when stdout is a terminal (or STUDIO_CONSOLE=rich, as the
+    # TUI sets); plain when piped/logged. STUDIO_CONSOLE=plain|rich|verbose overrides.
+    local console="${STUDIO_CONSOLE:-}"
+    [ -z "$console" ] && { [ -t 1 ] && console=rich || console=plain; }
+    # real screen width for the status-row trimming in gradle_output_filter
+    [ -z "${STUDIO_COLS:-}" ] && [ -t 1 ] && \
+        export STUDIO_COLS="$(stty size </dev/tty 2>/dev/null | cut -d' ' -f2)"
     ( cd "$proj" && \
-      env "${jdk_env[@]}" ANDROID_HOME="$SDK_DIR" ANDROID_SDK_ROOT="$SDK_DIR" \
-      "$gradle_bin" "${tasks[@]}" "${sign_props[@]}" "${jdk_props[@]}" "${perf_args[@]}" --no-daemon --console=plain )
+      env -i "${build_env[@]}" "${jdk_env[@]}" ANDROID_HOME="$SDK_DIR" ANDROID_SDK_ROOT="$SDK_DIR" \
+      "$gradle_bin" "${tasks[@]}" "${sign_props[@]}" "${jdk_props[@]}" "${perf_args[@]}" --daemon --console="$console" ) \
+      2>&1 | gradle_output_filter
+    # ^ Gradle's Android "unsupported" native integration fails EVERY env re-apply (even an
+    #   identical env) and warns each build; our env is fixed above, so that warning is noise.
     local rc=$?
 
     _restore; trap - EXIT INT TERM

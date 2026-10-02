@@ -179,6 +179,10 @@ ok "studio installed ($PREFIX/bin/studio, $PREFIX/bin/wadb, ~/.studio, ~/termux_
 step "5/6  Writing ~/.gradle/gradle.properties"
 mkdir -p "$HOME_DIR/.gradle"
 GP="$HOME_DIR/.gradle/gradle.properties"
+# Size the daemons to the device: Gradle heap = RAM/4 clamped to 1.5-4 GB, Kotlin = half that.
+MEM_MB=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo); CORES=$(nproc)
+GRADLE_HEAP=$(( MEM_MB / 4 )); [ "$GRADLE_HEAP" -gt 4096 ] && GRADLE_HEAP=4096; [ "$GRADLE_HEAP" -lt 1536 ] && GRADLE_HEAP=1536
+KOTLIN_HEAP=$(( GRADLE_HEAP / 2 )); [ "$KOTLIN_HEAP" -lt 1024 ] && KOTLIN_HEAP=1024
 [ -f "$GP" ] && cp -f "$GP" "$GP.bak.$(date +%s)" && info "backed up existing gradle.properties"
 JDK21="$JVM_DIR/java-21-openjdk"
 cat > "$GP" <<EOF
@@ -192,16 +196,26 @@ android.aapt2FromMavenOverride=$BT36/aapt2
 # gradle/gradle-daemon-jvm.properties (which pins a JetBrains JDK only Studio ships).
 org.gradle.java.home=$JDK21
 
-# Performance tuning for on-device builds
+# Performance tuning for on-device builds (sized for this device: ${MEM_MB} MB RAM, ${CORES} cores).
+# Persistent warm daemons (studio build runs them with a fixed env) + configuration cache +
+# a warm Kotlin compile daemon: incremental builds ~4x faster than one-shot --no-daemon.
 org.gradle.daemon=true
+org.gradle.daemon.idletimeout=1200000
 org.gradle.parallel=true
-org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+org.gradle.workers.max=${CORES}
+org.gradle.jvmargs=-Xmx${GRADLE_HEAP}m -Xms64m -XX:+UseParallelGC -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8
 org.gradle.caching=true
-kotlin.daemon.jvmargs=-Xmx1536m
+org.gradle.configuration-cache=true
+org.gradle.configuration-cache.parallel=true
+org.gradle.configuration-cache.problems=warn
+org.gradle.configureondemand=true
+kotlin.incremental=true
+kotlin.compiler.execution.strategy=daemon
+kotlin.daemon.jvmargs=-Xmx${KOTLIN_HEAP}m -XX:+UseParallelGC
 android.useAndroidX=true
 systemProp.java.net.preferIPv4Stack=true
 EOF
-ok "gradle.properties written (aapt2 override + JDK 21 pin)"
+ok "gradle.properties written (aapt2 override + JDK 21 pin + ${GRADLE_HEAP}m/${CORES}-core tuning)"
 
 # .bashrc env (idempotent)
 BRC="$HOME_DIR/.bashrc"; touch "$BRC"

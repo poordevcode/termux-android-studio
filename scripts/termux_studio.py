@@ -160,6 +160,11 @@ class TermuxStudio:
         env["ANDROID_HOME"] = self.android_home
         env["ANDROID_SDK_ROOT"] = self.android_home
         env["JAVA_OPTS"] = "-Djava.net.preferIPv4Stack=true"
+        # Gradle's rich console: live progress bar + "Resolve dependencies…"/downloads during
+        # configuration (the plain console is blank there and looks stuck).
+        env.setdefault("STUDIO_CONSOLE", "rich")
+        # the build runs in its own session (no /dev/tty), so hand studio the screen width
+        env.setdefault("STUDIO_COLS", str(shutil.get_terminal_size((80, 24)).columns))
 
         print(f"\n{Colors.YELLOW}Executing: {' '.join(cmd)}{Colors.END}")
         print(f"{Colors.CYAN}(press Ctrl-C to cancel the build){Colors.END}\n")
@@ -174,29 +179,21 @@ class TermuxStudio:
                 cwd=self.project_path,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                text=True,
                 env=env,
                 start_new_session=True,
             )
 
-            # Read stdout line by line and print
+            # Stream raw bytes straight to the terminal. The rich console redraws its status
+            # line in place (cursor moves, no newline), so line-by-line reading would freeze the
+            # live progress; Gradle colours failures/success itself.
+            fd = process.stdout.fileno()
+            out = sys.stdout.buffer
             while True:
-                line = process.stdout.readline()
-                if not line:
+                chunk = os.read(fd, 65536)
+                if not chunk:
                     break
-
-                # Highlight and print lines
-                clean_line = line.strip()
-                if "FAILED" in clean_line or "ERROR" in clean_line or "Exception" in clean_line:
-                    print(f"{Colors.RED}{line}{Colors.END}", end="")
-                elif "WARNING" in clean_line or "Warning" in clean_line:
-                    print(f"{Colors.YELLOW}{line}{Colors.END}", end="")
-                elif clean_line.startswith("> Task"):
-                    print(f"{Colors.GREEN}{line}{Colors.END}", end="")
-                elif "Build successful" in clean_line or "SUCCESSFUL" in clean_line:
-                    print(f"{Colors.BOLD}{Colors.GREEN}{line}{Colors.END}", end="")
-                else:
-                    print(line, end="")
+                out.write(chunk)
+                out.flush()
 
             process.wait()
 

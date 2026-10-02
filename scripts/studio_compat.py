@@ -38,7 +38,18 @@ STUDIO_DIR = os.path.join(HOME, ".studio")
 GRADLE_CACHE = os.path.join(STUDIO_DIR, "gradle")
 STASH_ROOT = os.path.join(STUDIO_DIR, "compat-stash")
 
-SYSTEM_GRADLE = "9.5.1"          # the gradle on PATH (see termux-android-build-setup)
+def _system_gradle_version(default="9.5.1"):
+    """Version of the gradle on PATH (Termux pkg), read from its jar names — pkg upgrades move it."""
+    import glob
+    for j in glob.glob(os.path.join(os.environ.get("PREFIX", "/data/data/com.termux/files/usr"),
+                                    "opt", "gradle", "lib", "gradle-core-api-*.jar")):
+        m = re.search(r"gradle-core-api-([\d.]+)\.jar$", j)
+        if m:
+            return m.group(1)
+    return default
+
+
+SYSTEM_GRADLE = _system_gradle_version()   # the gradle on PATH (see termux-android-build-setup)
 AAPT2_MAX_SDK = 37               # highest resources.arsc our native aapt2 parses
 TARGET_AGP = "9.2.1"             # known-good AGP for this device (matches studio_new.py)
 MIN_AGP_FOR_GRADLE9 = (8, 9)     # AGP below this tends to break on Gradle 9.x
@@ -156,7 +167,8 @@ def installed_platforms(sdk):
     out = set()
     if os.path.isdir(d):
         for n in os.listdir(d):
-            m = re.match(r"android-(\d+)$", n)
+            # SDK 36.1+ installs as "android-<major>.<minor>" (e.g. android-37.0)
+            m = re.match(r"android-(\d+)(?:\.\d+)?$", n)
             if m:
                 out.add(int(m.group(1)))
     return out
