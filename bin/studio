@@ -213,6 +213,17 @@ resolve_build_jdk() {
     return 0   # empty -> use whatever ~/.gradle/gradle.properties pins
 }
 
+# Signature-mismatch policy for installs: when the device already has the package signed
+# with a different key (INSTALL_FAILED_UPDATE_INCOMPATIBLE), uninstall it and install the new
+# APK. That wipes the old app's data — `studio run --no-uninstall` keeps the old failure instead.
+SIG_REINSTALL="${STUDIO_SIG_REINSTALL:-1}"
+
+# Package name from a pm/adb "signatures do not match" error, e.g.
+# "Existing package com.foo.app signatures do not match newer version".
+sig_mismatch_pkg() {
+    echo "$1" | sed -n 's/.*[Pp]ackage \([A-Za-z0-9_.]*\) signatures do not match.*/\1/p' | head -n1
+}
+
 # Byte-stream filter for gradle output: passes everything through IMMEDIATELY (the rich
 # console redraws its status line without newlines, so a line-buffered filter like sed would
 # freeze the live progress) and drops only the 4-line "Unable to set daemon's environment
@@ -1448,10 +1459,26 @@ shizuku_install() {   # $1 apk, $2 pkg
         ok "installed via Shizuku${pkg:+ ($pkg)}"
         return 0
     fi
+    if echo "$out" | grep -qi "INSTALL_FAILED_UPDATE_INCOMPATIBLE" && [ "$SIG_REINSTALL" = "1" ]; then
+        local opkg; opkg="$(sig_mismatch_pkg "$out")"; opkg="${opkg:-$pkg}"
+        if [ -n "$opkg" ]; then
+            warn "installed ${BOLD}$opkg${NC}${YELLOW} is signed with a different key — uninstalling it (its app data is removed) and installing the new APK…"
+            local uout; uout="$(shizuku_exec "pm uninstall $opkg" 60 2>&1 | tr -d '\r')"
+            if echo "$uout" | grep -qi "Success"; then
+                out="$(shizuku_exec "$remote" 150 2>&1 | tr -d '\r')"; rc=$?
+                if echo "$out" | grep -qi "Success"; then
+                    ok "reinstalled via Shizuku ($opkg, new signature)"
+                    return 0
+                fi
+            else
+                err "uninstall of $opkg failed: ${uout:-<no output>}"
+            fi
+        fi
+    fi
     err "Android package install failed through Shizuku (exit $rc):"; echo "${out:-<no output from pm>}" >&2
     if echo "$out" | grep -qi "INSTALL_FAILED_UPDATE_INCOMPATIBLE"; then
         echo -e "     The installed app was signed with a different key. Build/sign with that same key," >&2
-        echo -e "     or uninstall the existing app first (uninstalling removes its app data)." >&2
+        echo -e "     or let studio replace it: drop --no-uninstall (uninstalling removes its app data)." >&2
         return 1
     fi
     if echo "$out" | grep -qi "INSTALL_PARSE_FAILED_NO_CERTIFICATES"; then
@@ -1541,7 +1568,7 @@ studio_logcat() {
 
 studio_run() {
     # studio run [path] [--release|--debug] [--no-launch|--launch] [--logcat|--no-logcat]
-    #            [--shizuku] [--remember] [extra gradle tasks...]
+    #            [--shizuku] [--remember] [--no-uninstall] [extra gradle tasks...]
     # Choices not given on the command line fall back to what --remember saved for the
     # project (variant/launch/logcat), then to the usual defaults (debug/launch/no logcat).
     local proj="" variant="" launch="" tail_log="" use_shizuku=0 remember=0 extra=()
@@ -1555,6 +1582,7 @@ studio_run() {
             --launch)    launch=1 ;;
             --logcat|--log) tail_log=1 ;;
             --shizuku|--rish) use_shizuku=1 ;;
+            --no-uninstall) SIG_REINSTALL=0 ;;
             --no-logcat)    tail_log=0 ;;
             --remember)  remember=1 ;;
             *)           extra+=("$1") ;;
@@ -1646,7 +1674,20 @@ studio_run() {
         info "Installing via adb…"
         # -r reinstall keeping data, -d allow version downgrade, -t allow test packages.
         local out
-        out="$(adb install -r -d -t "$apk" 2>&1)" || { err "adb install failed:"; echo "$out" >&2; return 1; }
+        if ! out="$(adb install -r -d -t "$apk" 2>&1)"; then
+            local opkg; opkg="$(sig_mismatch_pkg "$out")"; opkg="${opkg:-$pkg}"
+            if echo "$out" | grep -qi "INSTALL_FAILED_UPDATE_INCOMPATIBLE" \
+               && [ "$SIG_REINSTALL" = "1" ] && [ -n "$opkg" ]; then
+                warn "installed ${BOLD}$opkg${NC}${YELLOW} is signed with a different key — uninstalling it (its app data is removed) and installing the new APK…"
+                adb uninstall "$opkg" >/dev/null 2>&1 || warn "adb uninstall $opkg reported a failure; trying the install anyway"
+                out="$(adb install -r -d -t "$apk" 2>&1)" || { err "adb install failed:"; echo "$out" >&2; return 1; }
+            else
+                err "adb install failed:"; echo "$out" >&2
+                echo "$out" | grep -qi "INSTALL_FAILED_UPDATE_INCOMPATIBLE" && \
+                    echo -e "     Different signing key on the device; drop --no-uninstall to let studio replace it." >&2
+                return 1
+            fi
+        fi
         ok "installed via adb"
         if [ "$launch" = "1" ] && [ -n "$pkg" ]; then
             info "Launching $pkg…"
@@ -1948,6 +1989,7 @@ usage() {
     echo -e "                 Release lint: skipped for speed by default; ${CYAN}--lint${NC} keeps the lintVitalRelease scan"
     echo -e "                 (release builds with no keystore are signed with the debug keystore)"
     echo -e "  ${GREEN}run${NC}  [path] [--release] [--no-launch] [--logcat] [--shizuku] [signing flags]   Build, install & launch (like AS ▶)"
+    echo -e "        a different-key install on the device is uninstalled + replaced (data lost); ${BOLD}--no-uninstall${NC} to refuse"
     echo -e "  ${GREEN}remember${NC} [clear] [path]   Show/forget remembered choices; save them by adding"
     echo -e "                 ${CYAN}--remember${NC} to a build/run — run keeps variant/launch/logcat,"
     echo -e "                 release builds keep keystore + APK name (shared with the TUI)"
