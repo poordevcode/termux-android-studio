@@ -23,8 +23,14 @@
 
 - 🏗️ **One-command builds** — `studio build` runs Gradle with the right toolchain (system Gradle, native aapt2, JDK pin) without touching your project's committed Android Studio config.
 - 📦 **Native aarch64 `aapt2`** — self-built from AOSP source; parses **Android SDK 35/36/37** `resources.arsc` that Termux's stock aapt2 chokes on.
-- ▶️ **Run on device like the green ▶** — `studio run` builds, installs and launches over **wireless `adb`** (Android 11+, no root/USB) or the system package installer, with verified-install detection.
+- ▶️ **Run on device like the green ▶** — `studio run` builds, installs and launches over **Shizuku**, **wireless `adb`** (Android 11+, no root/USB), or the system package installer with verified-install detection.
+- ⚡ **Shizuku 1-click silent installs** — `studio run --shizuku` installs APKs without adb pairing or root via a persistent held-binder bridge. Supports headless `--no-launch` for agents/CI.
+- 🛠️ **Native C/C++ support (NDK & CMake)** — `studio ndk install` sets up verified aarch64 NDK toolchains (`r29`, `r28c`, `r27d`, `r26d`) and CMake so native C/C++ modules build out of the box.
+- 🚀 **Warmed daemons & live console** — RAM-tuned persistent daemons (clean builds ~3x faster, incremental ~5x faster) with live Gradle progress bars auto-fitted to narrow mobile screens.
+- 🔄 **Signature-mismatch self-healing** — Automatically uninstalls and replaces outdated conflicting test APKs on `INSTALL_FAILED_UPDATE_INCOMPATIBLE` without manual `pm uninstall`.
 - 🔐 **Release signing made easy** — pick a keystore alias after entering the password, remember keystore details, or **create a keystore step-by-step**; auto-signs with a debug key if you have none.
+- 💾 **Remember preferences** — save preferred build/run flags, keystores, and APK names with `--remember`, or inspect with `studio remember`.
+- 🎯 **Direct Gradle tasks** — `studio gradle [path] <tasks...>` runs unit tests, linters (`testDebugUnitTest`, `:app:lintDebug`), or custom tasks with Termux's toolchain pre-configured.
 - 🏷️ **Smart APK naming** — release APKs are renamed to `<App Name>_<version>.apk`, or set your own with `--apk-name`.
 - 📤 **Share from the terminal** — push the built APK straight to the Android share sheet (APK, or ZIP-wrapped for apps that reject APKs).
 - ☕ **Multi-JDK** — install/manage **JDK 11/17/21** and auto-select the right one per project's Gradle/AGP.
@@ -78,7 +84,10 @@ The installer pkg-installs the JDKs/Gradle, downloads + configures the Android S
 
 ```bash
 studio new "My App" --compose --build      # scaffold + build a Jetpack Compose app
-studio run ~/AndroidStudioProjects/MyApp   # build → install → launch on device
+studio run ~/AndroidStudioProjects/MyApp   # build → install → launch on device (auto-replaces older signatures)
+studio run ~/AndroidStudioProjects/MyApp --shizuku  # 1-click silent install via Shizuku (no adb needed)
+studio gradle ~/AndroidStudioProjects/MyApp testDebugUnitTest  # run unit tests
+studio ndk install                         # one-time aarch64 NDK setup for native C/C++ builds
 studio start                               # interactive TUI (auto-reopens last project)
 ```
 
@@ -91,11 +100,15 @@ studio start                               # interactive TUI (auto-reopens last 
 | `studio load [path]` | Adapt an existing project for Termux |
 | `studio build [path] [tasks…]` | Build (default `:app:assembleDebug`) |
 | `studio build … assembleRelease --apk-name NAME` | Signed release with a custom output name |
-| `studio run [path] [--release] [--logcat]` | Build, install & launch (adb or installer) |
+| `studio run [path] [--release] [--shizuku] [--logcat]` | Build, install & launch (Shizuku, wireless adb, or package installer) |
+| `studio gradle [path] <tasks/args…>` | Run any Gradle task (test, lint, etc.) with Termux toolchain |
+| `studio shizuku {status\|start\|restart\|sync\|install}` | Manage Shizuku integration & silent background installs |
+| `studio ndk {list\|install [ver]\|use <ver>\|which}` | Manage native aarch64 NDKs (r29/r28c/r27d/r26d) & C/C++ builds |
 | `studio jdk {list\|install\|use\|which}` | Manage build JDKs (11/17/21) |
-| `studio adb pair` | One-time wireless-debugging setup (no root/USB) |
-| `studio logcat [pkg\|path]` | Stream the app's logs |
-| `studio doctor` | Diagnose the setup |
+| `studio adb {pair\|connect\|disconnect\|status}` | Wireless debugging setup (Android 11+, no root/USB) |
+| `studio logcat [pkg\|path]` | Stream the app's debug logs |
+| `studio remember [clear] [path]` | Show or clear remembered build/run choices |
+| `studio doctor` | Diagnose the environment and toolchain |
 | `studio start` | Launch the interactive TUI |
 
 ## 🔬 How it works
@@ -118,7 +131,13 @@ Key flags: `--target=aarch64-linux-android34` (bionic fdsan), `-DFMT_CONSTEVAL=`
 
 ## ❓ FAQ
 
-**Does this need root?** No. Wireless `adb` uses Android 11+ self-pairing over loopback; installs otherwise go through the system package installer.
+**Does this need root?** No. Installs can go through **Shizuku** (silent background install without adb pairing), wireless `adb` (Android 11+ loopback pairing), or the standard system package installer. None require root.
+
+**How does Shizuku installation work?** If you have Shizuku running, pass `--shizuku` to `studio run` (e.g. `studio run --shizuku`). It communicates directly with the Shizuku server using a persistent held-binder bridge to perform `pm install` silently in the background.
+
+**Can I build projects with C/C++ native code (NDK)?** Yes! Run `studio ndk install` to download a native aarch64 NDK (`r29` by default, or pick from `r28c`, `r27d`, `r26d`) and CMake. AGP detects the toolchain automatically.
+
+**What happens if an app has a different signing signature already installed?** `studio run` automatically detects `INSTALL_FAILED_UPDATE_INCOMPATIBLE`, uninstalls the mismatched build, and installs the fresh APK so development iteration is never blocked. (Pass `--no-uninstall` if you want to prevent automatic removal).
 
 **Will it mess up my Android Studio project?** No. All Termux tweaks live in `~/.gradle`/`~/.studio`; in-repo build patches are reverted automatically.
 
